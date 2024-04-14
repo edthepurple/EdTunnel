@@ -41,8 +41,8 @@ var xorKey = []byte("your_secret_key")
 
 func main() {
 	// Parse command line arguments
-	fromAddrStr := flag.String("from", "127.0.0.1:8080", "UDP address to forward from")
-	toAddrStr := flag.String("to", "127.0.0.1:9090", "UDP address to forward to")
+	fromAddrStr := flag.String("from", "0.0.0.0:27015", "UDP address to forward from")
+	toAddrStr := flag.String("to", "127.0.0.1:8443", "UDP address to forward to")
 	flag.Parse()
 
 	fromAddr, err := net.ResolveUDPAddr("udp", *fromAddrStr)
