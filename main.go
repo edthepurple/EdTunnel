@@ -2,13 +2,17 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/subtle"
+	"encoding/binary"
 	"flag"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"log"
 	"net"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -22,27 +26,28 @@ const (
 	// Optimized buffer sizes
 	tcpBufferSize = 64 * 1024  // 64KB for TCP
 	udpBufferSize = 4 * 1024   // 4KB for UDP (handles most packets + some batching)
+	
+	// Binary protocol constants
+	protocolTCP = uint8(1)
+	protocolUDP = uint8(2)
+	
+	// Binary message sizes
+	protocolHeaderSize = 3 // 1 byte protocol + 2 bytes port
+	
+	// Sharding constants
+	numShards = 64 // Must be power of 2 for efficient modulo
+	shardMask = numShards - 1
+	
+	// Worker pool constants
+	maxWorkers = 1000
+	workerQueueSize = 100
+	
+	// Batch constants
+	batchUpdateInterval = 100 * time.Millisecond
+	maxBatchSize = 100
 )
 
-// Connection management configuration
-var (
-	// TCP settings
-	tcpKeepalive       = 60 * time.Second  // TCP keepalive interval
-	tcpKeepAlivePeriod = 30 * time.Second  // TCP keepalive probe interval
-	tcpIdleTimeout     = 5 * time.Minute   // Close idle TCP connections after 5 minutes
-	
-	// UDP settings
-	udpSessionTimeout  = 2 * time.Minute   // Close idle UDP sessions after 2 minutes
-	udpCleanupInterval = 30 * time.Second  // How often to check for stale UDP sessions
-	
-	// Session monitoring
-	sessionPingInterval = 10 * time.Second // How often to check session health
-)
-
-// Global tunnel state tracking
-var tunnelActive int32 // atomic: 0 = no tunnel, 1 = tunnel active
-
-// Buffer pools for zero-copy optimizations
+// Buffer pools for efficient memory reuse
 var (
 	tcpBufferPool = sync.Pool{
 		New: func() interface{} {
@@ -55,101 +60,304 @@ var (
 			return make([]byte, udpBufferSize)
 		},
 	}
+	
+	protocolHeaderPool = sync.Pool{
+		New: func() interface{} {
+			return &ProtocolHeader{}
+		},
+	}
+	
+	handshakePool = sync.Pool{
+		New: func() interface{} {
+			return &HandshakeMessage{}
+		},
+	}
 )
 
-// Connection tracking
-type ConnectionTracker struct {
+// Binary protocol structures
+type HandshakeMessage struct {
+	Token    []byte
+	TCPPorts []uint16
+	UDPPorts []uint16
+}
+
+type ProtocolHeader struct {
+	Protocol uint8  // 1=TCP, 2=UDP
+	Port     uint16 // Port number
+}
+
+// Bandwidth limiting structures - optimized with local caching
+type TokenBucket struct {
+	capacity     int64         // Maximum tokens
+	tokens       int64         // Current tokens (atomic)
+	refillRate   int64         // Tokens per second
+	lastRefill   int64         // Last refill time (atomic, unix nano)
+	mu           sync.Mutex    // Protects refill operations
+	localTokens  int64         // Local cache to reduce atomic operations
+	localRefill  int64         // Local refill cache
+}
+
+func NewTokenBucket(bitsPerSecond int64) *TokenBucket {
+	// Convert bits per second to bytes per second
+	bytesPerSecond := bitsPerSecond / 8
+	
+	// Set capacity to allow for short bursts (1 second worth of data)
+	capacity := bytesPerSecond
+	if capacity < 64*1024 {
+		capacity = 64 * 1024 // Minimum 64KB capacity
+	}
+	
+	now := time.Now().UnixNano()
+	return &TokenBucket{
+		capacity:    capacity,
+		tokens:      capacity,
+		refillRate:  bytesPerSecond,
+		lastRefill:  now,
+		localTokens: capacity,
+		localRefill: now,
+	}
+}
+
+func (tb *TokenBucket) TakeTokens(amount int64) bool {
+	// Try local cache first to reduce atomic operations
+	if tb.localTokens >= amount {
+		tb.localTokens -= amount
+		return true
+	}
+	
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+	
+	now := time.Now().UnixNano()
+	lastRefill := atomic.LoadInt64(&tb.lastRefill)
+	
+	// Calculate tokens to add based on time elapsed
+	elapsed := now - lastRefill
+	tokensToAdd := (elapsed / int64(time.Second)) * tb.refillRate
+	
+	if tokensToAdd > 0 {
+		currentTokens := atomic.LoadInt64(&tb.tokens)
+		newTokens := currentTokens + tokensToAdd
+		if newTokens > tb.capacity {
+			newTokens = tb.capacity
+		}
+		atomic.StoreInt64(&tb.tokens, newTokens)
+		atomic.StoreInt64(&tb.lastRefill, now)
+		
+		// Update local cache
+		tb.localTokens = newTokens
+		tb.localRefill = now
+	}
+	
+	if tb.localTokens >= amount {
+		tb.localTokens -= amount
+		atomic.AddInt64(&tb.tokens, -amount)
+		return true
+	}
+	
+	return false
+}
+
+func (tb *TokenBucket) WaitForTokens(amount int64) {
+	for !tb.TakeTokens(amount) {
+		// Calculate sleep time based on refill rate
+		sleepTime := time.Duration((amount * int64(time.Second)) / tb.refillRate)
+		if sleepTime < time.Millisecond {
+			sleepTime = time.Millisecond
+		} else if sleepTime > 100*time.Millisecond {
+			sleepTime = 100 * time.Millisecond
+		}
+		time.Sleep(sleepTime)
+	}
+}
+
+type ConnectionLimiter struct {
+	uploadLimiter   *TokenBucket
+	downloadLimiter *TokenBucket
+}
+
+func NewConnectionLimiter(bitsPerSecond int64) *ConnectionLimiter {
+	return &ConnectionLimiter{
+		uploadLimiter:   NewTokenBucket(bitsPerSecond),
+		downloadLimiter: NewTokenBucket(bitsPerSecond),
+	}
+}
+
+// Connection management configuration
+var (
+	// TCP settings
+	tcpKeepalive       = 60 * time.Second  // TCP keepalive interval
+	tcpKeepAlivePeriod = 30 * time.Second  // TCP keepalive probe interval
+	tcpIdleTimeout     = 5 * time.Minute   // Close idle TCP connections after 5 minutes
+	
+	// UDP settings
+	udpSessionTimeout  = 2 * time.Minute   // Close idle UDP sessions after 2 minutes
+	udpCleanupInterval = 30 * time.Second  // How often to check for stale UDP sessions
+	udpOperationTimeout = 10 * time.Second // Timeout for individual UDP operations
+	
+	// Session monitoring
+	sessionPingInterval = 10 * time.Second // How often to check session health
+	
+	// Global bandwidth limit (0 = no limit)
+	globalBandwidthLimit int64 = 0
+)
+
+// Global tunnel state tracking
+var tunnelActive int32 // atomic: 0 = no tunnel, 1 = tunnel active
+
+// Sharded connection tracking for better concurrency
+type ConnectionShard struct {
 	mu          sync.RWMutex
 	connections map[string]*ConnectionInfo
-	counter     int64
+}
+
+type ConnectionTracker struct {
+	shards  [numShards]*ConnectionShard
+	counter int64 // atomic counter
 }
 
 type ConnectionInfo struct {
 	id        string
 	conn      net.Conn
-	createdAt time.Time
-	lastSeen  time.Time
+	createdAt int64 // atomic: Unix nanoseconds
+	lastSeen  int64 // atomic: Unix nanoseconds
 	connType  string // "tcp" or "udp"
+	limiter   *ConnectionLimiter // bandwidth limiter for this connection
 }
 
 func NewConnectionTracker() *ConnectionTracker {
-	return &ConnectionTracker{
-		connections: make(map[string]*ConnectionInfo),
+	ct := &ConnectionTracker{}
+	for i := 0; i < numShards; i++ {
+		ct.shards[i] = &ConnectionShard{
+			connections: make(map[string]*ConnectionInfo),
+		}
 	}
+	return ct
+}
+
+func (ct *ConnectionTracker) getShard(id string) *ConnectionShard {
+	h := fnv.New32a()
+	h.Write([]byte(id))
+	return ct.shards[h.Sum32()&shardMask]
 }
 
 func (ct *ConnectionTracker) Add(conn net.Conn, connType string) string {
-	ct.mu.Lock()
-	defer ct.mu.Unlock()
-	
 	id := fmt.Sprintf("%s_%d", connType, atomic.AddInt64(&ct.counter, 1))
-	now := time.Now()
+	now := time.Now().UnixNano()
 	
-	ct.connections[id] = &ConnectionInfo{
+	var limiter *ConnectionLimiter
+	if globalBandwidthLimit > 0 {
+		limiter = NewConnectionLimiter(globalBandwidthLimit)
+	}
+	
+	info := &ConnectionInfo{
 		id:        id,
 		conn:      conn,
 		createdAt: now,
 		lastSeen:  now,
 		connType:  connType,
+		limiter:   limiter,
 	}
+	
+	shard := ct.getShard(id)
+	shard.mu.Lock()
+	shard.connections[id] = info
+	shard.mu.Unlock()
 	
 	return id
 }
 
 func (ct *ConnectionTracker) Update(id string) {
-	ct.mu.Lock()
-	defer ct.mu.Unlock()
+	shard := ct.getShard(id)
+	shard.mu.RLock()
+	info, exists := shard.connections[id]
+	shard.mu.RUnlock()
 	
-	if info, exists := ct.connections[id]; exists {
-		info.lastSeen = time.Now()
+	if exists {
+		atomic.StoreInt64(&info.lastSeen, time.Now().UnixNano())
 	}
 }
 
-func (ct *ConnectionTracker) Remove(id string) {
-	ct.mu.Lock()
-	defer ct.mu.Unlock()
+func (ct *ConnectionTracker) GetLimiter(id string) *ConnectionLimiter {
+	shard := ct.getShard(id)
+	shard.mu.RLock()
+	info, exists := shard.connections[id]
+	shard.mu.RUnlock()
 	
-	delete(ct.connections, id)
+	if exists {
+		return info.limiter
+	}
+	return nil
+}
+
+func (ct *ConnectionTracker) Remove(id string) {
+	shard := ct.getShard(id)
+	shard.mu.Lock()
+	delete(shard.connections, id)
+	shard.mu.Unlock()
 }
 
 func (ct *ConnectionTracker) CleanupStale() int {
-	ct.mu.Lock()
-	defer ct.mu.Unlock()
-	
-	now := time.Now()
+	now := time.Now().UnixNano()
 	cleaned := 0
 	
-	for id, info := range ct.connections {
-		var timeout time.Duration
-		if info.connType == "tcp" {
-			timeout = tcpIdleTimeout
-		} else {
-			timeout = udpSessionTimeout
+	for _, shard := range ct.shards {
+		var toDelete []string
+		var toClose []net.Conn
+		
+		shard.mu.RLock()
+		for id, info := range shard.connections {
+			lastSeen := atomic.LoadInt64(&info.lastSeen)
+			var timeout time.Duration
+			if info.connType == "tcp" {
+				timeout = tcpIdleTimeout
+			} else {
+				timeout = udpSessionTimeout
+			}
+			
+			if time.Duration(now-lastSeen) > timeout {
+				toDelete = append(toDelete, id)
+				toClose = append(toClose, info.conn)
+				cleaned++
+			}
+		}
+		shard.mu.RUnlock()
+		
+		// Close connections outside of lock
+		for _, conn := range toClose {
+			conn.Close()
 		}
 		
-		if now.Sub(info.lastSeen) > timeout {
-			log.Printf("Closing stale %s connection %s (idle for %v)", 
-				info.connType, id, now.Sub(info.lastSeen))
-			info.conn.Close()
-			delete(ct.connections, id)
-			cleaned++
+		// Delete stale connections
+		if len(toDelete) > 0 {
+			shard.mu.Lock()
+			for _, id := range toDelete {
+				delete(shard.connections, id)
+			}
+			shard.mu.Unlock()
 		}
+	}
+	
+	if cleaned > 0 {
+		log.Printf("Cleaned up %d stale connections", cleaned)
 	}
 	
 	return cleaned
 }
 
 func (ct *ConnectionTracker) Stats() (int, int) {
-	ct.mu.RLock()
-	defer ct.mu.RUnlock()
-	
 	tcp, udp := 0, 0
-	for _, info := range ct.connections {
-		if info.connType == "tcp" {
-			tcp++
-		} else {
-			udp++
+	
+	for _, shard := range ct.shards {
+		shard.mu.RLock()
+		for _, info := range shard.connections {
+			if info.connType == "tcp" {
+				tcp++
+			} else {
+				udp++
+			}
 		}
+		shard.mu.RUnlock()
 	}
 	
 	return tcp, udp
@@ -157,28 +365,474 @@ func (ct *ConnectionTracker) Stats() (int, int) {
 
 var globalConnTracker = NewConnectionTracker()
 
+// Worker pool for handling connections
+type WorkerPool struct {
+	taskQueue chan func()
+	workers   int32 // atomic
+	maxWorkers int32
+}
+
+func NewWorkerPool(maxWorkers int) *WorkerPool {
+	wp := &WorkerPool{
+		taskQueue:  make(chan func(), workerQueueSize),
+		maxWorkers: int32(maxWorkers),
+	}
+	
+	// Start initial workers
+	initialWorkers := runtime.NumCPU() * 2
+	if initialWorkers > maxWorkers {
+		initialWorkers = maxWorkers
+	}
+	
+	for i := 0; i < initialWorkers; i++ {
+		wp.startWorker()
+	}
+	
+	return wp
+}
+
+func (wp *WorkerPool) startWorker() {
+	if atomic.LoadInt32(&wp.workers) >= wp.maxWorkers {
+		return
+	}
+	
+	atomic.AddInt32(&wp.workers, 1)
+	go func() {
+		defer atomic.AddInt32(&wp.workers, -1)
+		
+		for task := range wp.taskQueue {
+			task()
+		}
+	}()
+}
+
+func (wp *WorkerPool) Submit(task func()) {
+	select {
+	case wp.taskQueue <- task:
+	default:
+		// Queue is full, try to start a new worker
+		wp.startWorker()
+		// Block until we can submit
+		wp.taskQueue <- task
+	}
+}
+
+func (wp *WorkerPool) Close() {
+	close(wp.taskQueue)
+}
+
+var globalWorkerPool = NewWorkerPool(maxWorkers)
+
+// UDPSession - optimized with reduced atomic operations
 type UDPSession struct {
-	stream     *smux.Stream
-	clientAddr *net.UDPAddr
-	lastSeen   time.Time
-	mu         sync.RWMutex
+	stream      *smux.Stream
+	clientAddr  *net.UDPAddr
+	lastSeen    int64 // atomic: Unix nanoseconds
+	cancel      context.CancelFunc
+	mu          sync.RWMutex
+	closed      int32 // atomic: 0 = open, 1 = closed
+	connID      string
+	localActive int64 // local cache for activity
+}
+
+func NewUDPSession(stream *smux.Stream, clientAddr *net.UDPAddr, connID string) *UDPSession {
+	now := time.Now().UnixNano()
+	return &UDPSession{
+		stream:      stream,
+		clientAddr:  clientAddr,
+		lastSeen:    now,
+		closed:      0,
+		connID:      connID,
+		localActive: now,
+	}
 }
 
 func (us *UDPSession) UpdateActivity() {
-	us.mu.Lock()
-	us.lastSeen = time.Now()
-	us.mu.Unlock()
+	if atomic.LoadInt32(&us.closed) == 0 {
+		now := time.Now().UnixNano()
+		us.localActive = now
+		// Batch update to reduce atomic operations
+		if now-atomic.LoadInt64(&us.lastSeen) > int64(batchUpdateInterval) {
+			atomic.StoreInt64(&us.lastSeen, now)
+			globalConnTracker.Update(us.connID)
+		}
+	}
 }
 
 func (us *UDPSession) IsStale() bool {
+	if atomic.LoadInt32(&us.closed) == 1 {
+		return true
+	}
+	// Use local cache first
+	if time.Duration(time.Now().UnixNano()-us.localActive) > udpSessionTimeout {
+		lastSeen := atomic.LoadInt64(&us.lastSeen)
+		return time.Duration(time.Now().UnixNano()-lastSeen) > udpSessionTimeout
+	}
+	return false
+}
+
+func (us *UDPSession) SetCancel(cancel context.CancelFunc) {
+	us.mu.Lock()
+	us.cancel = cancel
+	us.mu.Unlock()
+}
+
+func (us *UDPSession) Close() {
+	if atomic.CompareAndSwapInt32(&us.closed, 0, 1) {
+		us.mu.Lock()
+		if us.cancel != nil {
+			us.cancel()
+		}
+		if us.stream != nil {
+			us.stream.Close()
+		}
+		us.mu.Unlock()
+		globalConnTracker.Remove(us.connID)
+	}
+}
+
+func (us *UDPSession) IsClosed() bool {
+	return atomic.LoadInt32(&us.closed) == 1
+}
+
+func (us *UDPSession) Write(data []byte) error {
 	us.mu.RLock()
 	defer us.mu.RUnlock()
-	return time.Since(us.lastSeen) > udpSessionTimeout
+	
+	if atomic.LoadInt32(&us.closed) == 1 {
+		return fmt.Errorf("session closed")
+	}
+	
+	// Apply bandwidth limiting
+	if limiter := globalConnTracker.GetLimiter(us.connID); limiter != nil {
+		limiter.uploadLimiter.WaitForTokens(int64(len(data)))
+	}
+	
+	// Use cached deadline setting
+	us.stream.SetWriteDeadline(time.Now().Add(udpOperationTimeout))
+	_, err := us.stream.Write(data)
+	return err
+}
+
+// Sharded UDP forwarder for better concurrency
+type UDPSessionShard struct {
+	mu       sync.RWMutex
+	sessions map[string]*UDPSession
 }
 
 type UDPForwarder struct {
-	sessions sync.Map // string -> *UDPSession
-	session  *smux.Session
+	shards      [numShards]*UDPSessionShard
+	session     *smux.Session
+	mu          sync.RWMutex
+	cleanupLock sync.Mutex
+}
+
+func NewUDPForwarder(session *smux.Session) *UDPForwarder {
+	uf := &UDPForwarder{
+		session: session,
+	}
+	for i := 0; i < numShards; i++ {
+		uf.shards[i] = &UDPSessionShard{
+			sessions: make(map[string]*UDPSession),
+		}
+	}
+	return uf
+}
+
+func (uf *UDPForwarder) getShard(sessionKey string) *UDPSessionShard {
+	h := fnv.New32a()
+	h.Write([]byte(sessionKey))
+	return uf.shards[h.Sum32()&shardMask]
+}
+
+func (uf *UDPForwarder) GetOrCreateSession(sessionKey string, clientAddr *net.UDPAddr, targetPort uint16) (*UDPSession, error) {
+	shard := uf.getShard(sessionKey)
+	
+	// First try to get existing session
+	shard.mu.RLock()
+	if session, exists := shard.sessions[sessionKey]; exists {
+		if !session.IsClosed() {
+			shard.mu.RUnlock()
+			return session, nil
+		}
+	}
+	shard.mu.RUnlock()
+
+	// Need to create new session
+	uf.mu.Lock()
+	defer uf.mu.Unlock()
+
+	// Double-check after acquiring lock
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+	
+	if session, exists := shard.sessions[sessionKey]; exists {
+		if !session.IsClosed() {
+			return session, nil
+		}
+		delete(shard.sessions, sessionKey)
+	}
+
+	// Create new session
+	stream, err := uf.session.OpenStream()
+	if err != nil {
+		return nil, fmt.Errorf("failed to open stream: %v", err)
+	}
+
+	// Send binary protocol header using pool
+	header := protocolHeaderPool.Get().(*ProtocolHeader)
+	header.Protocol = protocolUDP
+	header.Port = targetPort
+	
+	stream.SetWriteDeadline(time.Now().Add(udpOperationTimeout))
+	_, err = stream.Write(header.Encode())
+	protocolHeaderPool.Put(header)
+	
+	if err != nil {
+		stream.Close()
+		return nil, fmt.Errorf("failed to write protocol header: %v", err)
+	}
+
+	// Create a dummy connection for tracking
+	dummyConn := &dummyUDPConn{addr: clientAddr}
+	connID := globalConnTracker.Add(dummyConn, "udp")
+
+	session := NewUDPSession(stream, clientAddr, connID)
+	shard.sessions[sessionKey] = session
+
+	return session, nil
+}
+
+type dummyUDPConn struct {
+	addr *net.UDPAddr
+}
+
+func (d *dummyUDPConn) Read(b []byte) (n int, err error)   { return 0, fmt.Errorf("not implemented") }
+func (d *dummyUDPConn) Write(b []byte) (n int, err error) { return 0, fmt.Errorf("not implemented") }
+func (d *dummyUDPConn) Close() error                      { return nil }
+func (d *dummyUDPConn) LocalAddr() net.Addr               { return d.addr }
+func (d *dummyUDPConn) RemoteAddr() net.Addr              { return d.addr }
+func (d *dummyUDPConn) SetDeadline(t time.Time) error     { return nil }
+func (d *dummyUDPConn) SetReadDeadline(t time.Time) error { return nil }
+func (d *dummyUDPConn) SetWriteDeadline(t time.Time) error { return nil }
+
+func (uf *UDPForwarder) CleanupStaleSessions() int {
+	uf.cleanupLock.Lock()
+	defer uf.cleanupLock.Unlock()
+
+	cleaned := 0
+	for _, shard := range uf.shards {
+		var toDelete []string
+		var sessions []*UDPSession
+
+		shard.mu.RLock()
+		for sessionKey, session := range shard.sessions {
+			if session.IsStale() {
+				toDelete = append(toDelete, sessionKey)
+				sessions = append(sessions, session)
+			}
+		}
+		shard.mu.RUnlock()
+
+		if len(toDelete) > 0 {
+			// Close sessions outside of lock
+			for _, session := range sessions {
+				session.Close()
+			}
+			
+			shard.mu.Lock()
+			for _, key := range toDelete {
+				delete(shard.sessions, key)
+			}
+			shard.mu.Unlock()
+			
+			cleaned += len(toDelete)
+		}
+	}
+
+	if cleaned > 0 {
+		log.Printf("Cleaned up %d stale UDP sessions", cleaned)
+	}
+
+	return cleaned
+}
+
+func (uf *UDPForwarder) Shutdown() {
+	uf.cleanupLock.Lock()
+	defer uf.cleanupLock.Unlock()
+
+	totalSessions := 0
+	for _, shard := range uf.shards {
+		var sessions []*UDPSession
+		var keys []string
+
+		shard.mu.Lock()
+		for sessionKey, session := range shard.sessions {
+			keys = append(keys, sessionKey)
+			sessions = append(sessions, session)
+		}
+		
+		// Close all sessions
+		for i, key := range keys {
+			sessions[i].Close()
+			delete(shard.sessions, key)
+		}
+		shard.mu.Unlock()
+		
+		totalSessions += len(sessions)
+	}
+
+	log.Printf("Shutdown: closed %d UDP sessions", totalSessions)
+}
+
+// Binary protocol functions - optimized
+func (h *HandshakeMessage) Encode() []byte {
+	buf := new(bytes.Buffer)
+	buf.Grow(4 + len(h.Token) + 2 + len(h.TCPPorts)*2 + 2 + len(h.UDPPorts)*2)
+	
+	// Write token length and data
+	binary.Write(buf, binary.BigEndian, uint32(len(h.Token)))
+	buf.Write(h.Token)
+	
+	// Write TCP ports count and data
+	binary.Write(buf, binary.BigEndian, uint16(len(h.TCPPorts)))
+	for _, port := range h.TCPPorts {
+		binary.Write(buf, binary.BigEndian, port)
+	}
+	
+	// Write UDP ports count and data
+	binary.Write(buf, binary.BigEndian, uint16(len(h.UDPPorts)))
+	for _, port := range h.UDPPorts {
+		binary.Write(buf, binary.BigEndian, port)
+	}
+	
+	return buf.Bytes()
+}
+
+func DecodeHandshakeMessage(data []byte) (*HandshakeMessage, error) {
+	buf := bytes.NewReader(data)
+	msg := handshakePool.Get().(*HandshakeMessage)
+	
+	// Reset the message
+	msg.Token = msg.Token[:0]
+	msg.TCPPorts = msg.TCPPorts[:0]
+	msg.UDPPorts = msg.UDPPorts[:0]
+	
+	// Read token
+	var tokenLen uint32
+	if err := binary.Read(buf, binary.BigEndian, &tokenLen); err != nil {
+		handshakePool.Put(msg)
+		return nil, fmt.Errorf("failed to read token length: %v", err)
+	}
+	
+	if cap(msg.Token) < int(tokenLen) {
+		msg.Token = make([]byte, tokenLen)
+	} else {
+		msg.Token = msg.Token[:tokenLen]
+	}
+	
+	if _, err := io.ReadFull(buf, msg.Token); err != nil {
+		handshakePool.Put(msg)
+		return nil, fmt.Errorf("failed to read token: %v", err)
+	}
+	
+	// Read TCP ports
+	var tcpCount uint16
+	if err := binary.Read(buf, binary.BigEndian, &tcpCount); err != nil {
+		handshakePool.Put(msg)
+		return nil, fmt.Errorf("failed to read TCP ports count: %v", err)
+	}
+	
+	if cap(msg.TCPPorts) < int(tcpCount) {
+		msg.TCPPorts = make([]uint16, tcpCount)
+	} else {
+		msg.TCPPorts = msg.TCPPorts[:tcpCount]
+	}
+	
+	for i := range msg.TCPPorts {
+		if err := binary.Read(buf, binary.BigEndian, &msg.TCPPorts[i]); err != nil {
+			handshakePool.Put(msg)
+			return nil, fmt.Errorf("failed to read TCP port %d: %v", i, err)
+		}
+	}
+	
+	// Read UDP ports
+	var udpCount uint16
+	if err := binary.Read(buf, binary.BigEndian, &udpCount); err != nil {
+		handshakePool.Put(msg)
+		return nil, fmt.Errorf("failed to read UDP ports count: %v", err)
+	}
+	
+	if cap(msg.UDPPorts) < int(udpCount) {
+		msg.UDPPorts = make([]uint16, udpCount)
+	} else {
+		msg.UDPPorts = msg.UDPPorts[:udpCount]
+	}
+	
+	for i := range msg.UDPPorts {
+		if err := binary.Read(buf, binary.BigEndian, &msg.UDPPorts[i]); err != nil {
+			handshakePool.Put(msg)
+			return nil, fmt.Errorf("failed to read UDP port %d: %v", i, err)
+		}
+	}
+	
+	return msg, nil
+}
+
+func (p *ProtocolHeader) Encode() []byte {
+	buf := make([]byte, protocolHeaderSize)
+	buf[0] = p.Protocol
+	binary.BigEndian.PutUint16(buf[1:3], p.Port)
+	return buf
+}
+
+func DecodeProtocolHeader(data []byte) (*ProtocolHeader, error) {
+	if len(data) < protocolHeaderSize {
+		return nil, fmt.Errorf("insufficient data for protocol header")
+	}
+	
+	header := protocolHeaderPool.Get().(*ProtocolHeader)
+	header.Protocol = data[0]
+	header.Port = binary.BigEndian.Uint16(data[1:3])
+	return header, nil
+}
+
+func parseBandwidth(bandwidthStr string) (int64, error) {
+	if bandwidthStr == "" {
+		return 0, nil
+	}
+	
+	bandwidthStr = strings.ToLower(strings.TrimSpace(bandwidthStr))
+	if bandwidthStr == "" {
+		return 0, nil
+	}
+	
+	var multiplier int64 = 1
+	var numStr string
+	
+	if strings.HasSuffix(bandwidthStr, "k") {
+		multiplier = 1000
+		numStr = bandwidthStr[:len(bandwidthStr)-1]
+	} else if strings.HasSuffix(bandwidthStr, "m") {
+		multiplier = 1000000
+		numStr = bandwidthStr[:len(bandwidthStr)-1]
+	} else if strings.HasSuffix(bandwidthStr, "g") {
+		multiplier = 1000000000
+		numStr = bandwidthStr[:len(bandwidthStr)-1]
+	} else {
+		numStr = bandwidthStr
+	}
+	
+	num, err := strconv.ParseFloat(numStr, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid bandwidth format: %s", bandwidthStr)
+	}
+	
+	if num <= 0 {
+		return 0, fmt.Errorf("bandwidth must be positive: %s", bandwidthStr)
+	}
+	
+	return int64(num * float64(multiplier)), nil
 }
 
 func main() {
@@ -189,10 +843,24 @@ func main() {
 	forwardudp := flag.String("forwardudp", "", "Local UDP ports to forward to, comma-separated (used in vpn mode)")
 	token := flag.String("token", "", "Pre-shared token required for tunnel auth (required)")
 	nonat := flag.Bool("nonat", false, "Use server's public IP as source for local connections (vpn mode only)")
+	limit := flag.String("limit", "", "Bandwidth limit per connection (e.g., 16m, 1g, 500k) - relay mode only")
 	flag.Parse()
 
 	if *token == "" {
 		log.Fatal("You must provide -token on both sides")
+	}
+
+	// Parse bandwidth limit (only for relay mode)
+	if *mode == "relay" && *limit != "" {
+		var err error
+		globalBandwidthLimit, err = parseBandwidth(*limit)
+		if err != nil {
+			log.Fatalf("Invalid bandwidth limit: %v", err)
+		}
+		if globalBandwidthLimit > 0 {
+			log.Printf("Relay: bandwidth limit set to %d bits/second (%.2f Mbps) per connection", 
+				globalBandwidthLimit, float64(globalBandwidthLimit)/1000000.0)
+		}
 	}
 
 	// Start connection cleanup goroutine
@@ -225,19 +893,16 @@ func main() {
 	}
 }
 
-// Configure TCP connection with keepalive and timeouts
 func configureTCPConnection(conn net.Conn) error {
 	tcpConn, ok := conn.(*net.TCPConn)
 	if !ok {
-		return nil // Not a TCP connection
+		return nil
 	}
 	
-	// Enable TCP keepalive
 	if err := tcpConn.SetKeepAlive(true); err != nil {
 		return fmt.Errorf("failed to enable keepalive: %v", err)
 	}
 	
-	// Set keepalive period
 	if err := tcpConn.SetKeepAlivePeriod(tcpKeepalive); err != nil {
 		return fmt.Errorf("failed to set keepalive period: %v", err)
 	}
@@ -245,13 +910,13 @@ func configureTCPConnection(conn net.Conn) error {
 	return nil
 }
 
-func parsePorts(portList string) ([]string, error) {
+func parsePorts(portList string) ([]uint16, error) {
 	if portList == "" {
 		return nil, nil
 	}
 	
 	ports := strings.Split(portList, ",")
-	var validPorts []string
+	validPorts := make([]uint16, 0, len(ports))
 	
 	for _, port := range ports {
 		port = strings.TrimSpace(port)
@@ -259,11 +924,12 @@ func parsePorts(portList string) ([]string, error) {
 			continue
 		}
 		
-		if portNum, err := strconv.Atoi(port); err != nil || portNum < 1 || portNum > 65535 {
+		portNum, err := strconv.Atoi(port)
+		if err != nil || portNum < 1 || portNum > 65535 {
 			return nil, fmt.Errorf("invalid port number: %s", port)
 		}
 		
-		validPorts = append(validPorts, port)
+		validPorts = append(validPorts, uint16(portNum))
 	}
 	
 	return validPorts, nil
@@ -283,14 +949,12 @@ func runRelay(listenPort, expectedToken string) {
 			continue
 		}
 
-		// Configure the tunnel connection
 		if err := configureTCPConnection(conn); err != nil {
 			log.Printf("Relay: failed to configure connection: %v", err)
 			conn.Close()
 			continue
 		}
 
-		// Check if a tunnel is already active
 		if atomic.LoadInt32(&tunnelActive) == 1 {
 			log.Printf("Relay: rejecting connection from %s - tunnel already active", conn.RemoteAddr())
 			conn.Close()
@@ -298,14 +962,15 @@ func runRelay(listenPort, expectedToken string) {
 		}
 
 		log.Printf("Relay: incoming tunnel from %s", conn.RemoteAddr())
-		go handleTunnel(conn, expectedToken)
+		globalWorkerPool.Submit(func() {
+			handleTunnel(conn, expectedToken)
+		})
 	}
 }
 
 func handleTunnel(rawConn net.Conn, expectedToken string) {
 	defer rawConn.Close()
 	
-	// Ensure we clear the tunnel state when this function exits
 	defer func() {
 		atomic.StoreInt32(&tunnelActive, 0)
 		log.Printf("Relay: tunnel closed, cleared active state")
@@ -318,157 +983,125 @@ func handleTunnel(rawConn net.Conn, expectedToken string) {
 	}
 	defer session.Close()
 
-	// Accept control stream for handshake
 	controlStream, err := session.AcceptStream()
 	if err != nil {
 		log.Printf("Failed to accept control stream: %v", err)
 		return
 	}
+	defer controlStream.Close()
 
-	reader := bufio.NewReader(controlStream)
-
-	// Read token
-	tokenLine, err := reader.ReadString('\n')
-	if err != nil {
-		controlStream.Close()
-		log.Printf("Failed to read token: %v", err)
+	var msgLen uint32
+	if err := binary.Read(controlStream, binary.BigEndian, &msgLen); err != nil {
+		log.Printf("Failed to read handshake length: %v", err)
 		return
 	}
-	receivedToken := strings.TrimSpace(tokenLine)
-
-	// Read forward ports
-	forwardLine, err := reader.ReadString('\n')
-	if err != nil {
-		controlStream.Close()
-		log.Printf("Failed to read forward ports: %v", err)
+	
+	handshakeData := make([]byte, msgLen)
+	if _, err := io.ReadFull(controlStream, handshakeData); err != nil {
+		log.Printf("Failed to read handshake data: %v", err)
 		return
 	}
-	forwardPortsStr := strings.TrimSpace(forwardLine)
 
-	// Read forward UDP ports
-	forwardUDPLine, err := reader.ReadString('\n')
+	handshake, err := DecodeHandshakeMessage(handshakeData)
 	if err != nil {
-		controlStream.Close()
-		log.Printf("Failed to read forward UDP ports: %v", err)
+		log.Printf("Failed to decode handshake: %v", err)
 		return
 	}
-	forwardUDPPortsStr := strings.TrimSpace(forwardUDPLine)
+	defer handshakePool.Put(handshake)
 
-	controlStream.Close()
-
-	// Validate token
-	if !constantTimeEqual(receivedToken, expectedToken) {
+	if !constantTimeEqual(string(handshake.Token), expectedToken) {
 		log.Printf("Relay: invalid token from %s", rawConn.RemoteAddr())
 		return
 	}
 
-	// Parse ports
-	forwardPorts, err := parsePorts(forwardPortsStr)
-	if err != nil {
-		log.Printf("Invalid TCP forward ports: %v", err)
-		return
-	}
-
-	forwardUDPPorts, err := parsePorts(forwardUDPPortsStr)
-	if err != nil {
-		log.Printf("Invalid UDP forward ports: %v", err)
-		return
-	}
-
-	if len(forwardPorts) == 0 && len(forwardUDPPorts) == 0 {
+	if len(handshake.TCPPorts) == 0 && len(handshake.UDPPorts) == 0 {
 		log.Printf("No forward ports specified")
 		return
 	}
 
-	// Mark tunnel as active after successful authentication
 	atomic.StoreInt32(&tunnelActive, 1)
-	log.Printf("Relay: authenticated tunnel - TCP:%v UDP:%v", forwardPorts, forwardUDPPorts)
+	log.Printf("Relay: authenticated tunnel - TCP:%v UDP:%v", handshake.TCPPorts, handshake.UDPPorts)
 
-	// Create context for managing tunnel lifecycle
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel() // Cancel context when tunnel closes
+	defer cancel()
 
-	// Start TCP listeners
 	var listeners []net.Listener
-	var udpListeners []*net.UDPConn
+	var udpForwarders []*UDPForwarder
 	defer func() {
-		log.Printf("Relay: cleaning up %d TCP listeners and %d UDP listeners", len(listeners), len(udpListeners))
+		log.Printf("Relay: cleaning up %d TCP listeners and %d UDP forwarders", len(listeners), len(udpForwarders))
 		for _, listener := range listeners {
 			listener.Close()
 		}
-		for _, udpListener := range udpListeners {
-			udpListener.Close()
+		for _, forwarder := range udpForwarders {
+			forwarder.Shutdown()
 		}
 	}()
 
-	for _, port := range forwardPorts {
-		listener, err := net.Listen("tcp", ":"+port)
+	for _, port := range handshake.TCPPorts {
+		portStr := fmt.Sprintf("%d", port)
+		listener, err := net.Listen("tcp", ":"+portStr)
 		if err != nil {
-			log.Printf("Failed to listen on TCP port %s: %v", port, err)
+			log.Printf("Failed to listen on TCP port %d: %v", port, err)
 			return
 		}
 		listeners = append(listeners, listener)
-		log.Printf("Relay: listening on :%s for TCP clients", port)
+		log.Printf("Relay: listening on :%d for TCP clients", port)
 
-		go func(l net.Listener, p string) {
+		go func(l net.Listener, p uint16) {
 			defer l.Close()
 			for {
-				// Check if tunnel is still active
 				select {
 				case <-ctx.Done():
-					log.Printf("Relay: TCP listener on port %s shutting down", p)
+					log.Printf("Relay: TCP listener on port %d shutting down", p)
 					return
 				default:
 				}
 
 				clientConn, err := l.Accept()
 				if err != nil {
-					// Check if it's because we're shutting down
 					select {
 					case <-ctx.Done():
 						return
 					default:
-						log.Printf("Relay: TCP accept error on port %s: %v", p, err)
+						log.Printf("Relay: TCP accept error on port %d: %v", p, err)
 						return
 					}
 				}
 
-				// Configure client connection
 				if err := configureTCPConnection(clientConn); err != nil {
 					log.Printf("Failed to configure client connection: %v", err)
 					clientConn.Close()
 					continue
 				}
 
-				go handleClientWithContext(ctx, clientConn, p, session)
+				globalWorkerPool.Submit(func() {
+					handleClientWithContext(ctx, clientConn, p, session)
+				})
 			}
 		}(listener, port)
 	}
 
-	// Start UDP listeners
-	for _, port := range forwardUDPPorts {
-		udpAddr, err := net.ResolveUDPAddr("udp", ":"+port)
+	for _, port := range handshake.UDPPorts {
+		portStr := fmt.Sprintf("%d", port)
+		udpAddr, err := net.ResolveUDPAddr("udp", ":"+portStr)
 		if err != nil {
-			log.Printf("Failed to resolve UDP address :%s: %v", port, err)
+			log.Printf("Failed to resolve UDP address :%d: %v", port, err)
 			return
 		}
 		udpListener, err := net.ListenUDP("udp", udpAddr)
 		if err != nil {
-			log.Printf("Failed to listen on UDP port %s: %v", port, err)
+			log.Printf("Failed to listen on UDP port %d: %v", port, err)
 			return
 		}
-		udpListeners = append(udpListeners, udpListener)
-		log.Printf("Relay: listening on :%s for UDP clients", port)
+		log.Printf("Relay: listening on :%d for UDP clients", port)
 
-		udpForwarder := &UDPForwarder{session: session}
-		go handleUDPRelayWithContext(ctx, udpListener, udpForwarder, port)
+		udpForwarder := NewUDPForwarder(session)
+		udpForwarders = append(udpForwarders, udpForwarder)
 		
-		// Start UDP session cleanup for this forwarder
+		go handleUDPRelayWithContext(ctx, udpListener, udpForwarder, port)
 		go cleanupUDPSessionsWithContext(ctx, udpForwarder)
 	}
 
-	// Wait for session to close naturally - this will detect broken connections
-	// without false positives from aggressive monitoring
 	go func() {
 		for !session.IsClosed() {
 			stream, err := session.AcceptStream()
@@ -478,38 +1111,34 @@ func handleTunnel(rawConn net.Conn, expectedToken string) {
 				break
 			}
 			
-			// Handle any unexpected streams
 			if stream != nil {
-				go func(s *smux.Stream) {
-					// Try to read the protocol line to determine stream type
-					reader := bufio.NewReader(s)
-					protoLine, err := reader.ReadString('\n')
-					if err != nil {
-						s.Close()
-						return
-					}
-					protoLine = strings.TrimSpace(protoLine)
-					
-					parts := strings.SplitN(protoLine, ":", 2)
-					if len(parts) != 2 {
-						s.Close()
-						return
-					}
-					
-					protocol := parts[0]
-					targetPort := parts[1]
-					
-					// This should not happen in relay mode, but handle it gracefully
-					log.Printf("Relay: unexpected stream %s:%s", protocol, targetPort)
-					s.Close()
-				}(stream)
+				globalWorkerPool.Submit(func() {
+					handleUnexpectedStream(stream)
+				})
 			}
 		}
 	}()
 
-	// Wait for context to be cancelled (session closed or error)
 	<-ctx.Done()
 	log.Printf("Relay: tunnel context cancelled, cleaning up")
+}
+
+func handleUnexpectedStream(s *smux.Stream) {
+	defer s.Close()
+	
+	headerData := make([]byte, protocolHeaderSize)
+	if _, err := io.ReadFull(s, headerData); err != nil {
+		return
+	}
+	
+	header, err := DecodeProtocolHeader(headerData)
+	if err != nil {
+		log.Printf("Relay: failed to decode protocol header: %v", err)
+		return
+	}
+	defer protocolHeaderPool.Put(header)
+	
+	log.Printf("Relay: unexpected stream %d:%d", header.Protocol, header.Port)
 }
 
 func cleanupUDPSessionsWithContext(ctx context.Context, forwarder *UDPForwarder) {
@@ -521,42 +1150,20 @@ func cleanupUDPSessionsWithContext(ctx context.Context, forwarder *UDPForwarder)
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			var toDelete []string
-			
-			forwarder.sessions.Range(func(key, value interface{}) bool {
-				sessionKey := key.(string)
-				session := value.(*UDPSession)
-				
-				if session.IsStale() {
-					toDelete = append(toDelete, sessionKey)
-					session.stream.Close()
-				}
-				
-				return true
-			})
-			
-			for _, key := range toDelete {
-				forwarder.sessions.Delete(key)
-			}
-			
-			if len(toDelete) > 0 {
-				log.Printf("Cleaned up %d stale UDP sessions", len(toDelete))
-			}
+			forwarder.CleanupStaleSessions()
 		}
 	}
 }
 
-func handleClientWithContext(ctx context.Context, clientConn net.Conn, port string, session *smux.Session) {
+func handleClientWithContext(ctx context.Context, clientConn net.Conn, port uint16, session *smux.Session) {
 	defer clientConn.Close()
 
-	// Check if tunnel is still active
 	select {
 	case <-ctx.Done():
 		return
 	default:
 	}
 
-	// Track this connection
 	connID := globalConnTracker.Add(clientConn, "tcp")
 	defer globalConnTracker.Remove(connID)
 
@@ -567,149 +1174,127 @@ func handleClientWithContext(ctx context.Context, clientConn net.Conn, port stri
 	}
 	defer stream.Close()
 
-	// Send protocol message
-	protocolMsg := fmt.Sprintf("TCP:%s\n", port)
-	_, err = stream.Write([]byte(protocolMsg))
+	header := protocolHeaderPool.Get().(*ProtocolHeader)
+	header.Protocol = protocolTCP
+	header.Port = port
+	
+	_, err = stream.Write(header.Encode())
+	protocolHeaderPool.Put(header)
+	
 	if err != nil {
-		log.Printf("Failed to write protocol message: %v", err)
+		log.Printf("Failed to write protocol header: %v", err)
 		return
 	}
 
-	// Proxy the connection with optimized copying and activity tracking
 	proxyPairOptimizedWithTrackingAndContext(ctx, clientConn, stream, connID)
 }
 
-func handleClient(clientConn net.Conn, port string, session *smux.Session) {
-	// This is kept for backward compatibility, but creates a background context
-	ctx := context.Background()
-	handleClientWithContext(ctx, clientConn, port, session)
-}
-
-func handleUDPRelayWithContext(ctx context.Context, udpListener *net.UDPConn, forwarder *UDPForwarder, targetPort string) {
+func handleUDPRelayWithContext(ctx context.Context, udpListener *net.UDPConn, forwarder *UDPForwarder, targetPort uint16) {
 	defer udpListener.Close()
 	
-	// Use pooled buffer for UDP operations
 	buffer := udpBufferPool.Get().([]byte)
 	defer udpBufferPool.Put(buffer)
 
 	for {
-		// Check if tunnel is still active
 		select {
 		case <-ctx.Done():
-			log.Printf("Relay: UDP listener on port %s shutting down", targetPort)
+			log.Printf("Relay: UDP listener on port %d shutting down", targetPort)
 			return
 		default:
 		}
 
-		// Set a read timeout so we can check context periodically
 		udpListener.SetReadDeadline(time.Now().Add(1 * time.Second))
 		
 		n, clientAddr, err := udpListener.ReadFromUDP(buffer)
 		if err != nil {
-			// Check if it's a timeout and context is still active
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				continue // Continue loop to check context
+				continue
 			}
 			
-			// Check if we're shutting down
 			select {
 			case <-ctx.Done():
 				return
 			default:
-				log.Printf("UDP read error on port %s: %v", targetPort, err)
+				log.Printf("UDP read error on port %d: %v", targetPort, err)
 				return
 			}
 		}
 
-		sessionKey := fmt.Sprintf("%s:%s", clientAddr.String(), targetPort)
+		sessionKey := fmt.Sprintf("%s:%d", clientAddr.String(), targetPort)
 
-		if sessionVal, exists := forwarder.sessions.Load(sessionKey); exists {
-			session := sessionVal.(*UDPSession)
-			session.UpdateActivity()
-			_, err = session.stream.Write(buffer[:n])
-			if err != nil {
-				session.stream.Close()
-				forwarder.sessions.Delete(sessionKey)
-			}
-			continue
-		}
-
-		// Create new UDP session
-		stream, err := forwarder.session.OpenStream()
+		session, err := forwarder.GetOrCreateSession(sessionKey, clientAddr, targetPort)
 		if err != nil {
+			log.Printf("Failed to get/create UDP session: %v", err)
 			continue
 		}
 
-		protocolMsg := fmt.Sprintf("UDP:%s\n", targetPort)
-		_, err = stream.Write([]byte(protocolMsg))
-		if err != nil {
-			stream.Close()
-			continue
-		}
-
-		session := &UDPSession{
-			stream:     stream,
-			clientAddr: clientAddr,
-			lastSeen:   time.Now(),
-		}
-
-		forwarder.sessions.Store(sessionKey, session)
-
-		// Start response handler with pooled buffer
-		go func(s *UDPSession, key string) {
-			defer s.stream.Close()
-			buffer := udpBufferPool.Get().([]byte)
-			defer udpBufferPool.Put(buffer)
-
-			for {
-				// Check context
-				select {
-				case <-ctx.Done():
-					forwarder.sessions.Delete(key)
-					return
-				default:
-				}
-
-				n, err := s.stream.Read(buffer)
-				if err != nil {
-					break
-				}
-
-				_, err = udpListener.WriteToUDP(buffer[:n], s.clientAddr)
-				if err != nil {
-					break
-				}
-				
-				s.UpdateActivity()
-			}
-
-			forwarder.sessions.Delete(key)
-		}(session, sessionKey)
-
-		// Forward initial packet
 		session.UpdateActivity()
-		_, err = session.stream.Write(buffer[:n])
-		if err != nil {
-			session.stream.Close()
+		if err := session.Write(buffer[:n]); err != nil {
+			log.Printf("Failed to write to UDP session: %v", err)
+			continue
+		}
+
+		if session.cancel == nil {
+			respCtx, respCancel := context.WithCancel(ctx)
+			session.SetCancel(respCancel)
+			
+			globalWorkerPool.Submit(func() {
+				handleUDPResponse(respCtx, session, udpListener, sessionKey, forwarder)
+			})
 		}
 	}
 }
 
-func handleUDPRelay(udpListener *net.UDPConn, forwarder *UDPForwarder, targetPort string) {
-	// This is kept for backward compatibility, but creates a background context
-	ctx := context.Background()
-	handleUDPRelayWithContext(ctx, udpListener, forwarder, targetPort)
+func handleUDPResponse(ctx context.Context, session *UDPSession, udpListener *net.UDPConn, sessionKey string, forwarder *UDPForwarder) {
+	defer func() {
+		session.Close()
+		shard := forwarder.getShard(sessionKey)
+		shard.mu.Lock()
+		delete(shard.sessions, sessionKey)
+		shard.mu.Unlock()
+	}()
+
+	buffer := udpBufferPool.Get().([]byte)
+	defer udpBufferPool.Put(buffer)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		if session.IsClosed() {
+			return
+		}
+
+		session.stream.SetReadDeadline(time.Now().Add(udpOperationTimeout))
+		
+		n, err := session.stream.Read(buffer)
+		if err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				if session.IsStale() {
+					return
+				}
+				continue
+			}
+			return
+		}
+
+		if limiter := globalConnTracker.GetLimiter(session.connID); limiter != nil {
+			limiter.downloadLimiter.WaitForTokens(int64(n))
+		}
+
+		_, err = udpListener.WriteToUDP(buffer[:n], session.clientAddr)
+		if err != nil {
+			return
+		}
+		
+		session.UpdateActivity()
+	}
 }
 
-func cleanupUDPSessions(forwarder *UDPForwarder) {
-	// This is kept for backward compatibility, but creates a background context
-	ctx := context.Background()
-	cleanupUDPSessionsWithContext(ctx, forwarder)
-}
-
-// Get the public IP address of this machine
 func getPublicIP() (net.IP, error) {
-	// First try to get IP by connecting to a well-known address
 	conn, err := net.Dial("udp", "8.8.8.8:80")
 	if err != nil {
 		return nil, err
@@ -720,7 +1305,6 @@ func getPublicIP() (net.IP, error) {
 	return localAddr.IP, nil
 }
 
-// Get the public IP and create appropriate dialers
 func setupDialers() (net.IP, *net.Dialer, *net.Dialer, error) {
 	publicIP, err := getPublicIP()
 	if err != nil {
@@ -729,13 +1313,11 @@ func setupDialers() (net.IP, *net.Dialer, *net.Dialer, error) {
 
 	log.Printf("VPN: using source IP %s for local connections", publicIP)
 
-	// Create TCP dialer with public IP as source
 	tcpDialer := &net.Dialer{
 		LocalAddr: &net.TCPAddr{IP: publicIP},
 		Timeout:   30 * time.Second,
 	}
 
-	// Create UDP dialer with public IP as source  
 	udpDialer := &net.Dialer{
 		LocalAddr: &net.UDPAddr{IP: publicIP},
 		Timeout:   30 * time.Second,
@@ -759,7 +1341,6 @@ func runVPN(relayHost, relayPort, forwardPorts, forwardUDPPorts, token string, n
 
 	var tcpDialer, udpDialer *net.Dialer
 
-	// Setup dialers with public IP only if -nonat is specified
 	if nonat {
 		_, tcpDialer, udpDialer, err = setupDialers()
 		if err != nil {
@@ -767,7 +1348,12 @@ func runVPN(relayHost, relayPort, forwardPorts, forwardUDPPorts, token string, n
 		}
 	}
 
-	handshakeMsg := fmt.Sprintf("%s\n%s\n%s\n", token, forwardPorts, forwardUDPPorts)
+	handshake := handshakePool.Get().(*HandshakeMessage)
+	handshake.Token = []byte(token)
+	handshake.TCPPorts = tcpPorts
+	handshake.UDPPorts = udpPorts
+	handshakeData := handshake.Encode()
+	handshakePool.Put(handshake)
 
 	for {
 		log.Printf("VPN: dialing relay %s", relayAddr)
@@ -778,7 +1364,6 @@ func runVPN(relayHost, relayPort, forwardPorts, forwardUDPPorts, token string, n
 			continue
 		}
 
-		// Configure relay connection
 		if err := configureTCPConnection(relayConn); err != nil {
 			log.Printf("VPN: failed to configure relay connection: %v", err)
 			relayConn.Close()
@@ -794,7 +1379,6 @@ func runVPN(relayHost, relayPort, forwardPorts, forwardUDPPorts, token string, n
 			continue
 		}
 
-		// Send handshake
 		ctrl, err := session.OpenStream()
 		if err != nil {
 			session.Close()
@@ -804,8 +1388,16 @@ func runVPN(relayHost, relayPort, forwardPorts, forwardUDPPorts, token string, n
 			continue
 		}
 
-		_, err = ctrl.Write([]byte(handshakeMsg))
-		if err != nil {
+		if err := binary.Write(ctrl, binary.BigEndian, uint32(len(handshakeData))); err != nil {
+			ctrl.Close()
+			session.Close()
+			relayConn.Close()
+			log.Printf("VPN: failed to send handshake length: %v", err)
+			time.Sleep(5 * time.Second)
+			continue
+		}
+
+		if _, err := ctrl.Write(handshakeData); err != nil {
 			ctrl.Close()
 			session.Close()
 			relayConn.Close()
@@ -817,14 +1409,15 @@ func runVPN(relayHost, relayPort, forwardPorts, forwardUDPPorts, token string, n
 
 		log.Printf("VPN: session established - TCP:%v UDP:%v", tcpPorts, udpPorts)
 
-		// Handle incoming streams
 		for {
 			stream, err := session.AcceptStream()
 			if err != nil {
 				log.Printf("VPN: session accept error: %v", err)
 				break
 			}
-			go handleVPNStream(stream, tcpPorts, udpPorts, tcpDialer, udpDialer)
+			globalWorkerPool.Submit(func() {
+				handleVPNStream(stream, tcpPorts, udpPorts, tcpDialer, udpDialer)
+			})
 		}
 
 		session.Close()
@@ -834,65 +1427,57 @@ func runVPN(relayHost, relayPort, forwardPorts, forwardUDPPorts, token string, n
 	}
 }
 
-func handleVPNStream(stream *smux.Stream, tcpPorts, udpPorts []string, tcpDialer, udpDialer *net.Dialer) {
+func handleVPNStream(stream *smux.Stream, tcpPorts, udpPorts []uint16, tcpDialer, udpDialer *net.Dialer) {
 	defer stream.Close()
 
-	reader := bufio.NewReader(stream)
-	protoLine, err := reader.ReadString('\n')
+	headerData := make([]byte, protocolHeaderSize)
+	if _, err := io.ReadFull(stream, headerData); err != nil {
+		log.Printf("VPN: failed to read protocol header: %v", err)
+		return
+	}
+
+	header, err := DecodeProtocolHeader(headerData)
 	if err != nil {
-		log.Printf("VPN: failed to read protocol line: %v", err)
+		log.Printf("VPN: failed to decode protocol header: %v", err)
 		return
 	}
-	protoLine = strings.TrimSpace(protoLine)
+	defer protocolHeaderPool.Put(header)
 
-	parts := strings.SplitN(protoLine, ":", 2)
-	if len(parts) != 2 {
-		log.Printf("VPN: invalid protocol line: %s", protoLine)
-		return
-	}
-
-	protocol := parts[0]
-	targetPort := parts[1]
-
-	if protocol == "TCP" && contains(tcpPorts, targetPort) {
+	if header.Protocol == protocolTCP && containsPort(tcpPorts, header.Port) {
 		var localConn net.Conn
 		var err error
 		
-		// Use custom dialer if provided (nonat mode), otherwise use default
+		targetAddr := fmt.Sprintf("127.0.0.1:%d", header.Port)
+		
 		if tcpDialer != nil {
-			localConn, err = tcpDialer.Dial("tcp", "127.0.0.1:"+targetPort)
+			localConn, err = tcpDialer.Dial("tcp", targetAddr)
 		} else {
-			localConn, err = net.Dial("tcp", "127.0.0.1:"+targetPort)
+			localConn, err = net.Dial("tcp", targetAddr)
 		}
 		
 		if err != nil {
-			log.Printf("VPN: failed to connect to local TCP port %s: %v", targetPort, err)
+			log.Printf("VPN: failed to connect to local TCP port %d: %v", header.Port, err)
 			return
 		}
 		defer localConn.Close()
 
-		// Configure local connection
 		if err := configureTCPConnection(localConn); err != nil {
 			log.Printf("VPN: failed to configure local connection: %v", err)
 			return
 		}
 
-		// Track this connection
-		connID := globalConnTracker.Add(localConn, "tcp")
-		defer globalConnTracker.Remove(connID)
+		proxyPairOptimized(localConn, stream)
 
-		proxyPairOptimizedWithTrackingAndContext(context.Background(), localConn, stream, connID)
-
-	} else if protocol == "UDP" && contains(udpPorts, targetPort) {
-		udpAddr, err := net.ResolveUDPAddr("udp", "127.0.0.1:"+targetPort)
+	} else if header.Protocol == protocolUDP && containsPort(udpPorts, header.Port) {
+		targetAddr := fmt.Sprintf("127.0.0.1:%d", header.Port)
+		udpAddr, err := net.ResolveUDPAddr("udp", targetAddr)
 		if err != nil {
-			log.Printf("VPN: failed to resolve UDP address for port %s: %v", targetPort, err)
+			log.Printf("VPN: failed to resolve UDP address for port %d: %v", header.Port, err)
 			return
 		}
 
 		var udpConn net.Conn
 		
-		// Use custom dialer if provided (nonat mode), otherwise use default
 		if udpDialer != nil {
 			udpConn, err = udpDialer.Dial("udp", udpAddr.String())
 		} else {
@@ -900,69 +1485,91 @@ func handleVPNStream(stream *smux.Stream, tcpPorts, udpPorts []string, tcpDialer
 		}
 		
 		if err != nil {
-			log.Printf("VPN: failed to connect to local UDP port %s: %v", targetPort, err)
+			log.Printf("VPN: failed to connect to local UDP port %d: %v", header.Port, err)
 			return
 		}
 		defer udpConn.Close()
 
-		// Track this connection
-		connID := globalConnTracker.Add(udpConn, "udp")
-		defer globalConnTracker.Remove(connID)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
 
-		// Bidirectional UDP forwarding with pooled buffers and activity tracking
 		done := make(chan struct{}, 2)
 
-		// Stream to UDP
 		go func() {
+			defer func() { done <- struct{}{} }()
 			buffer := udpBufferPool.Get().([]byte)
 			defer udpBufferPool.Put(buffer)
 			
 			for {
-				// Set read deadline
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
+				
 				stream.SetReadDeadline(time.Now().Add(udpSessionTimeout))
 				
 				n, err := stream.Read(buffer)
 				if err != nil {
-					break
+					if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+						continue
+					}
+					return
 				}
 				
-				globalConnTracker.Update(connID)
+				udpConn.SetWriteDeadline(time.Now().Add(udpOperationTimeout))
 				_, err = udpConn.Write(buffer[:n])
 				if err != nil {
-					break
+					return
 				}
 			}
-			done <- struct{}{}
 		}()
 
-		// UDP to Stream
 		go func() {
+			defer func() { done <- struct{}{} }()
 			buffer := udpBufferPool.Get().([]byte)
 			defer udpBufferPool.Put(buffer)
 			
 			for {
-				// Set read deadline
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
+				
 				udpConn.SetReadDeadline(time.Now().Add(udpSessionTimeout))
 				
 				n, err := udpConn.Read(buffer)
 				if err != nil {
-					break
+					if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+						continue
+					}
+					return
 				}
 				
-				globalConnTracker.Update(connID)
+				stream.SetWriteDeadline(time.Now().Add(udpOperationTimeout))
 				_, err = stream.Write(buffer[:n])
 				if err != nil {
-					break
+					return
 				}
 			}
-			done <- struct{}{}
 		}()
 
 		<-done
+		cancel()
 
 	} else {
-		log.Printf("VPN: unauthorized protocol/port: %s", protoLine)
+		log.Printf("VPN: unauthorized protocol/port: %d/%d", header.Protocol, header.Port)
 	}
+}
+
+func containsPort(slice []uint16, item uint16) bool {
+	for _, s := range slice {
+		if s == item {
+			return true
+		}
+	}
+	return false
 }
 
 func contains(slice []string, item string) bool {
@@ -974,16 +1581,25 @@ func contains(slice []string, item string) bool {
 	return false
 }
 
-// Optimized proxy function with connection tracking, timeouts and context awareness
 func proxyPairOptimizedWithTrackingAndContext(ctx context.Context, a net.Conn, b net.Conn, connID string) {
 	defer a.Close()
 	defer b.Close()
 
 	done := make(chan struct{}, 2)
+	limiter := globalConnTracker.GetLimiter(connID)
+
+	// Get buffers from pool
+	bufferA := tcpBufferPool.Get().([]byte)
+	bufferB := tcpBufferPool.Get().([]byte)
+	defer tcpBufferPool.Put(bufferA)
+	defer tcpBufferPool.Put(bufferB)
+
+	// Cache timeout value
+	idleTimeout := tcpIdleTimeout
+	writeTimeout := 30 * time.Second
 
 	go func() {
-		buffer := tcpBufferPool.Get().([]byte)
-		defer tcpBufferPool.Put(buffer)
+		defer func() { done <- struct{}{} }()
 		
 		for {
 			select {
@@ -992,31 +1608,30 @@ func proxyPairOptimizedWithTrackingAndContext(ctx context.Context, a net.Conn, b
 			default:
 			}
 			
-			// Set read deadline to detect idle connections
-			a.SetReadDeadline(time.Now().Add(tcpIdleTimeout))
+			a.SetReadDeadline(time.Now().Add(idleTimeout))
 			
-			n, err := a.Read(buffer)
+			n, err := a.Read(bufferA)
 			if err != nil {
-				break
+				return
 			}
 			
-			// Update connection activity
+			if limiter != nil {
+				limiter.uploadLimiter.WaitForTokens(int64(n))
+			}
+			
 			globalConnTracker.Update(connID)
 			
-			// Set write deadline
-			b.SetWriteDeadline(time.Now().Add(30 * time.Second))
+			b.SetWriteDeadline(time.Now().Add(writeTimeout))
 			
-			_, err = b.Write(buffer[:n])
+			_, err = b.Write(bufferA[:n])
 			if err != nil {
-				break
+				return
 			}
 		}
-		done <- struct{}{}
 	}()
 
 	go func() {
-		buffer := tcpBufferPool.Get().([]byte)
-		defer tcpBufferPool.Put(buffer)
+		defer func() { done <- struct{}{} }()
 		
 		for {
 			select {
@@ -1025,26 +1640,26 @@ func proxyPairOptimizedWithTrackingAndContext(ctx context.Context, a net.Conn, b
 			default:
 			}
 			
-			// Set read deadline to detect idle connections
-			b.SetReadDeadline(time.Now().Add(tcpIdleTimeout))
+			b.SetReadDeadline(time.Now().Add(idleTimeout))
 			
-			n, err := b.Read(buffer)
+			n, err := b.Read(bufferB)
 			if err != nil {
-				break
+				return
 			}
 			
-			// Update connection activity
+			if limiter != nil {
+				limiter.downloadLimiter.WaitForTokens(int64(n))
+			}
+			
 			globalConnTracker.Update(connID)
 			
-			// Set write deadline
-			a.SetWriteDeadline(time.Now().Add(30 * time.Second))
+			a.SetWriteDeadline(time.Now().Add(writeTimeout))
 			
-			_, err = a.Write(buffer[:n])
+			_, err = a.Write(bufferB[:n])
 			if err != nil {
-				break
+				return
 			}
 		}
-		done <- struct{}{}
 	}()
 
 	select {
@@ -1053,30 +1668,29 @@ func proxyPairOptimizedWithTrackingAndContext(ctx context.Context, a net.Conn, b
 	}
 }
 
-// Optimized proxy function with connection tracking and timeouts (backward compatibility)
 func proxyPairOptimizedWithTracking(a net.Conn, b net.Conn, connID string) {
 	ctx := context.Background()
 	proxyPairOptimizedWithTrackingAndContext(ctx, a, b, connID)
 }
 
-// Optimized proxy function using pooled buffers and io.CopyBuffer (original)
 func proxyPairOptimized(a net.Conn, b net.Conn) {
 	defer a.Close()
 	defer b.Close()
 
 	done := make(chan struct{}, 2)
 
+	bufferA := tcpBufferPool.Get().([]byte)
+	bufferB := tcpBufferPool.Get().([]byte)
+	defer tcpBufferPool.Put(bufferA)
+	defer tcpBufferPool.Put(bufferB)
+
 	go func() {
-		buffer := tcpBufferPool.Get().([]byte)
-		defer tcpBufferPool.Put(buffer)
-		io.CopyBuffer(b, a, buffer)
+		io.CopyBuffer(b, a, bufferA)
 		done <- struct{}{}
 	}()
 
 	go func() {
-		buffer := tcpBufferPool.Get().([]byte)
-		defer tcpBufferPool.Put(buffer)
-		io.CopyBuffer(a, b, buffer)
+		io.CopyBuffer(a, b, bufferB)
 		done <- struct{}{}
 	}()
 
