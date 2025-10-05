@@ -1,1702 +1,1255 @@
 package main
 
 import (
-	"bufio"
-	"bytes"
-	"context"
-	"crypto/subtle"
-	"encoding/binary"
-	"flag"
-	"fmt"
-	"hash/fnv"
-	"io"
-	"log"
-	"net"
-	"runtime"
-	"strconv"
-	"strings"
-	"sync"
-	"sync/atomic"
-	"time"
+        "bufio"
+        "context"
+        "encoding/binary"
+        "flag"
+        "fmt"
+        "io"
+        "log"
+        "net"
+        "strconv"
+        "strings"
+        "sync"
+        "sync/atomic"
+        "time"
 
-	smux "github.com/xtaci/smux"
+        "github.com/xtaci/smux"
+        "golang.org/x/time/rate"
 )
+
+// Buffer pool for zero-allocation performance
+var bufferPool = sync.Pool{
+        New: func() interface{} {
+                buf := make([]byte, bufferSize)
+                return &buf
+        },
+}
+
+var udpBufferPool = sync.Pool{
+        New: func() interface{} {
+                buf := make([]byte, udpBufferSize)
+                return &buf
+        },
+}
+
+// TCP tuning for maximum throughput
+func tuneTCPConn(conn net.Conn) error {
+        tcpConn, ok := conn.(*net.TCPConn)
+        if !ok {
+                return nil
+        }
+
+        // Disable Nagle's algorithm for lower latency
+        if err := tcpConn.SetNoDelay(true); err != nil {
+                return err
+        }
+
+        // Set large buffers for high throughput
+        if err := tcpConn.SetReadBuffer(tcpReadBuffer); err != nil {
+                return err
+        }
+        if err := tcpConn.SetWriteBuffer(tcpWriteBuffer); err != nil {
+                return err
+        }
+
+        // Enable TCP keepalive
+        if err := tcpConn.SetKeepAlive(true); err != nil {
+                return err
+        }
+        if err := tcpConn.SetKeepAlivePeriod(keepAliveInterval); err != nil {
+                return err
+        }
+
+        return nil
+}
 
 const (
-	// Optimized buffer sizes
-	tcpBufferSize = 64 * 1024  // 64KB for TCP
-	udpBufferSize = 4 * 1024   // 4KB for UDP (handles most packets + some batching)
-	
-	// Binary protocol constants
-	protocolTCP = uint8(1)
-	protocolUDP = uint8(2)
-	
-	// Binary message sizes
-	protocolHeaderSize = 3 // 1 byte protocol + 2 bytes port
-	
-	// Sharding constants
-	numShards = 64 // Must be power of 2 for efficient modulo
-	shardMask = numShards - 1
-	
-	// Worker pool constants
-	maxWorkers = 1000
-	workerQueueSize = 100
-	
-	// Batch constants
-	batchUpdateInterval = 100 * time.Millisecond
-	maxBatchSize = 100
+        // Protocol constants
+        protocolVersion = byte(1)
+
+        // Configuration - optimized for maximum throughput
+        bufferSize       = 128 * 1024 // 128KB buffers for high throughput
+        udpBufferSize    = 65535      // Max size for uint16 length prefix
+        idleTimeout      = 5 * time.Minute
+        reconnectDelay   = 3 * time.Second
+        keepAliveInterval = 30 * time.Second
+
+        // TCP tuning for maximum throughput
+        tcpReadBuffer  = 4 * 1024 * 1024  // 4MB
+        tcpWriteBuffer = 4 * 1024 * 1024  // 4MB
+
+        // smux configuration for maximum performance
+        smuxVersion          = 1
+        smuxMaxFrameSize     = 65535        // Max uint16 value
+        smuxMaxReceiveBuffer = 16777216     // 16MB receive buffer
 )
 
-// Buffer pools for efficient memory reuse
-var (
-	tcpBufferPool = sync.Pool{
-		New: func() interface{} {
-			return make([]byte, tcpBufferSize)
-		},
-	}
-	
-	udpBufferPool = sync.Pool{
-		New: func() interface{} {
-			return make([]byte, udpBufferSize)
-		},
-	}
-	
-	protocolHeaderPool = sync.Pool{
-		New: func() interface{} {
-			return &ProtocolHeader{}
-		},
-	}
-	
-	handshakePool = sync.Pool{
-		New: func() interface{} {
-			return &HandshakeMessage{}
-		},
-	}
-)
-
-// Binary protocol structures
-type HandshakeMessage struct {
-	Token    []byte
-	TCPPorts []uint16
-	UDPPorts []uint16
+type Config struct {
+        Mode       string
+        Host       string
+        Port       string
+        Token      string
+        Forward    string
+        ForwardUDP string
+        Limit      string // e.g., "16m" for 16 Mbps
+        NoNAT      bool
+        limitBytesPerSec int64
 }
 
-type ProtocolHeader struct {
-	Protocol uint8  // 1=TCP, 2=UDP
-	Port     uint16 // Port number
+// parsePorts parses comma-separated port list
+func parsePorts(portList string) ([]string, error) {
+        if portList == "" {
+                return nil, nil
+        }
+        
+        ports := strings.Split(portList, ",")
+        var validPorts []string
+        
+        for _, port := range ports {
+                port = strings.TrimSpace(port)
+                if port == "" {
+                        continue
+                }
+                
+                if portNum, err := strconv.Atoi(port); err != nil || portNum < 1 || portNum > 65535 {
+                        return nil, fmt.Errorf("invalid port number: %s", port)
+                }
+                
+                validPorts = append(validPorts, port)
+        }
+        
+        return validPorts, nil
 }
 
-// Bandwidth limiting structures - optimized with local caching
-type TokenBucket struct {
-	capacity     int64         // Maximum tokens
-	tokens       int64         // Current tokens (atomic)
-	refillRate   int64         // Tokens per second
-	lastRefill   int64         // Last refill time (atomic, unix nano)
-	mu           sync.Mutex    // Protects refill operations
-	localTokens  int64         // Local cache to reduce atomic operations
-	localRefill  int64         // Local refill cache
+// parseBandwidthLimit parses bandwidth limit strings like "16m", "100k", "1g"
+func parseBandwidthLimit(limit string) (int64, error) {
+        if limit == "" {
+                return 0, nil
+        }
+
+        limit = strings.ToLower(strings.TrimSpace(limit))
+        if limit == "" {
+                return 0, nil
+        }
+
+        // Extract number and unit
+        var value float64
+        var unit string
+
+        if n, err := fmt.Sscanf(limit, "%f%s", &value, &unit); n < 1 || err != nil {
+                return 0, fmt.Errorf("invalid bandwidth limit format: %s", limit)
+        }
+
+        // Convert to bits per second (using 1024 multiplier)
+        var bitsPerSec float64
+        switch unit {
+        case "k", "kbps":
+                bitsPerSec = value * 1024
+        case "m", "mbps":
+                bitsPerSec = value * 1024 * 1024
+        case "g", "gbps":
+                bitsPerSec = value * 1024 * 1024 * 1024
+        case "": // No unit, assume Mbps
+                bitsPerSec = value * 1024 * 1024
+        default:
+                return 0, fmt.Errorf("unknown unit: %s (use k, m, or g)", unit)
+        }
+
+        // Convert to bytes per second
+        bytesPerSec := int64(bitsPerSec / 8)
+        return bytesPerSec, nil
 }
 
-func NewTokenBucket(bitsPerSecond int64) *TokenBucket {
-	// Convert bits per second to bytes per second
-	bytesPerSecond := bitsPerSecond / 8
-	
-	// Set capacity to allow for short bursts (1 second worth of data)
-	capacity := bytesPerSecond
-	if capacity < 64*1024 {
-		capacity = 64 * 1024 // Minimum 64KB capacity
-	}
-	
-	now := time.Now().UnixNano()
-	return &TokenBucket{
-		capacity:    capacity,
-		tokens:      capacity,
-		refillRate:  bytesPerSecond,
-		lastRefill:  now,
-		localTokens: capacity,
-		localRefill: now,
-	}
+// RateLimitedReader wraps an io.Reader with rate limiting
+type RateLimitedReader struct {
+        reader  io.Reader
+        limiter *rate.Limiter
 }
 
-func (tb *TokenBucket) TakeTokens(amount int64) bool {
-	// Try local cache first to reduce atomic operations
-	if tb.localTokens >= amount {
-		tb.localTokens -= amount
-		return true
-	}
-	
-	tb.mu.Lock()
-	defer tb.mu.Unlock()
-	
-	now := time.Now().UnixNano()
-	lastRefill := atomic.LoadInt64(&tb.lastRefill)
-	
-	// Calculate tokens to add based on time elapsed
-	elapsed := now - lastRefill
-	tokensToAdd := (elapsed / int64(time.Second)) * tb.refillRate
-	
-	if tokensToAdd > 0 {
-		currentTokens := atomic.LoadInt64(&tb.tokens)
-		newTokens := currentTokens + tokensToAdd
-		if newTokens > tb.capacity {
-			newTokens = tb.capacity
-		}
-		atomic.StoreInt64(&tb.tokens, newTokens)
-		atomic.StoreInt64(&tb.lastRefill, now)
-		
-		// Update local cache
-		tb.localTokens = newTokens
-		tb.localRefill = now
-	}
-	
-	if tb.localTokens >= amount {
-		tb.localTokens -= amount
-		atomic.AddInt64(&tb.tokens, -amount)
-		return true
-	}
-	
-	return false
+func NewRateLimitedReader(r io.Reader, bytesPerSec int64) *RateLimitedReader {
+        if bytesPerSec <= 0 {
+                return &RateLimitedReader{reader: r, limiter: nil}
+        }
+        // Large burst size to avoid delays: 2x rate or minimum 1MB
+        burst := int(bytesPerSec * 2)
+        if burst < 1024*1024 {
+                burst = 1024 * 1024
+        }
+        return &RateLimitedReader{
+                reader:  r,
+                limiter: rate.NewLimiter(rate.Limit(bytesPerSec), burst),
+        }
 }
 
-func (tb *TokenBucket) WaitForTokens(amount int64) {
-	for !tb.TakeTokens(amount) {
-		// Calculate sleep time based on refill rate
-		sleepTime := time.Duration((amount * int64(time.Second)) / tb.refillRate)
-		if sleepTime < time.Millisecond {
-			sleepTime = time.Millisecond
-		} else if sleepTime > 100*time.Millisecond {
-			sleepTime = 100 * time.Millisecond
-		}
-		time.Sleep(sleepTime)
-	}
+func (r *RateLimitedReader) Read(p []byte) (int, error) {
+        if r.limiter == nil {
+                return r.reader.Read(p)
+        }
+
+        n, err := r.reader.Read(p)
+        if n > 0 {
+                // Wait for tokens
+                r.limiter.WaitN(context.Background(), n)
+        }
+        return n, err
 }
 
-type ConnectionLimiter struct {
-	uploadLimiter   *TokenBucket
-	downloadLimiter *TokenBucket
+// RateLimitedWriter wraps an io.Writer with rate limiting
+type RateLimitedWriter struct {
+        writer  io.Writer
+        limiter *rate.Limiter
 }
 
-func NewConnectionLimiter(bitsPerSecond int64) *ConnectionLimiter {
-	return &ConnectionLimiter{
-		uploadLimiter:   NewTokenBucket(bitsPerSecond),
-		downloadLimiter: NewTokenBucket(bitsPerSecond),
-	}
+func NewRateLimitedWriter(w io.Writer, bytesPerSec int64) *RateLimitedWriter {
+        if bytesPerSec <= 0 {
+                return &RateLimitedWriter{writer: w, limiter: nil}
+        }
+        // Large burst size to avoid delays: 2x rate or minimum 1MB
+        burst := int(bytesPerSec * 2)
+        if burst < 1024*1024 {
+                burst = 1024 * 1024
+        }
+        return &RateLimitedWriter{
+                writer:  w,
+                limiter: rate.NewLimiter(rate.Limit(bytesPerSec), burst),
+        }
 }
 
-// Connection management configuration
-var (
-	// TCP settings
-	tcpKeepalive       = 60 * time.Second  // TCP keepalive interval
-	tcpKeepAlivePeriod = 30 * time.Second  // TCP keepalive probe interval
-	tcpIdleTimeout     = 5 * time.Minute   // Close idle TCP connections after 5 minutes
-	
-	// UDP settings
-	udpSessionTimeout  = 2 * time.Minute   // Close idle UDP sessions after 2 minutes
-	udpCleanupInterval = 30 * time.Second  // How often to check for stale UDP sessions
-	udpOperationTimeout = 10 * time.Second // Timeout for individual UDP operations
-	
-	// Session monitoring
-	sessionPingInterval = 10 * time.Second // How often to check session health
-	
-	// Global bandwidth limit (0 = no limit)
-	globalBandwidthLimit int64 = 0
-)
+func (w *RateLimitedWriter) Write(p []byte) (int, error) {
+        if w.limiter == nil {
+                return w.writer.Write(p)
+        }
 
-// Global tunnel state tracking
-var tunnelActive int32 // atomic: 0 = no tunnel, 1 = tunnel active
-
-// Sharded connection tracking for better concurrency
-type ConnectionShard struct {
-	mu          sync.RWMutex
-	connections map[string]*ConnectionInfo
+        // Wait for tokens before writing
+        w.limiter.WaitN(context.Background(), len(p))
+        return w.writer.Write(p)
 }
 
-type ConnectionTracker struct {
-	shards  [numShards]*ConnectionShard
-	counter int64 // atomic counter
+// Get the public IP address of this machine
+func getPublicIP() (net.IP, error) {
+        // Try to get IP by connecting to a well-known address
+        conn, err := net.Dial("udp", "8.8.8.8:80")
+        if err != nil {
+                return nil, err
+        }
+        defer conn.Close()
+
+        localAddr := conn.LocalAddr().(*net.UDPAddr)
+        return localAddr.IP, nil
 }
 
-type ConnectionInfo struct {
-	id        string
-	conn      net.Conn
-	createdAt int64 // atomic: Unix nanoseconds
-	lastSeen  int64 // atomic: Unix nanoseconds
-	connType  string // "tcp" or "udp"
-	limiter   *ConnectionLimiter // bandwidth limiter for this connection
+// Get the public IP and create appropriate dialers
+func setupDialers() (net.IP, *net.Dialer, *net.Dialer, error) {
+        publicIP, err := getPublicIP()
+        if err != nil {
+                return nil, nil, nil, fmt.Errorf("failed to get public IP: %v", err)
+        }
+
+        log.Printf("VPN: using source IP %s for local connections", publicIP)
+
+        // Create TCP dialer with public IP as source
+        tcpDialer := &net.Dialer{
+                LocalAddr: &net.TCPAddr{IP: publicIP},
+                Timeout:   30 * time.Second,
+        }
+
+        // Create UDP dialer with public IP as source  
+        udpDialer := &net.Dialer{
+                LocalAddr: &net.UDPAddr{IP: publicIP},
+                Timeout:   30 * time.Second,
+        }
+
+        return publicIP, tcpDialer, udpDialer, nil
 }
 
-func NewConnectionTracker() *ConnectionTracker {
-	ct := &ConnectionTracker{}
-	for i := 0; i < numShards; i++ {
-		ct.shards[i] = &ConnectionShard{
-			connections: make(map[string]*ConnectionInfo),
-		}
-	}
-	return ct
+// RelayServer handles incoming tunnel connections
+type RelayServer struct {
+        config    *Config
+        sessions  sync.Map // map[string]*Session
+        mu        sync.Mutex
 }
 
-func (ct *ConnectionTracker) getShard(id string) *ConnectionShard {
-	h := fnv.New32a()
-	h.Write([]byte(id))
-	return ct.shards[h.Sum32()&shardMask]
-}
-
-func (ct *ConnectionTracker) Add(conn net.Conn, connType string) string {
-	id := fmt.Sprintf("%s_%d", connType, atomic.AddInt64(&ct.counter, 1))
-	now := time.Now().UnixNano()
-	
-	var limiter *ConnectionLimiter
-	if globalBandwidthLimit > 0 {
-		limiter = NewConnectionLimiter(globalBandwidthLimit)
-	}
-	
-	info := &ConnectionInfo{
-		id:        id,
-		conn:      conn,
-		createdAt: now,
-		lastSeen:  now,
-		connType:  connType,
-		limiter:   limiter,
-	}
-	
-	shard := ct.getShard(id)
-	shard.mu.Lock()
-	shard.connections[id] = info
-	shard.mu.Unlock()
-	
-	return id
-}
-
-func (ct *ConnectionTracker) Update(id string) {
-	shard := ct.getShard(id)
-	shard.mu.RLock()
-	info, exists := shard.connections[id]
-	shard.mu.RUnlock()
-	
-	if exists {
-		atomic.StoreInt64(&info.lastSeen, time.Now().UnixNano())
-	}
-}
-
-func (ct *ConnectionTracker) GetLimiter(id string) *ConnectionLimiter {
-	shard := ct.getShard(id)
-	shard.mu.RLock()
-	info, exists := shard.connections[id]
-	shard.mu.RUnlock()
-	
-	if exists {
-		return info.limiter
-	}
-	return nil
-}
-
-func (ct *ConnectionTracker) Remove(id string) {
-	shard := ct.getShard(id)
-	shard.mu.Lock()
-	delete(shard.connections, id)
-	shard.mu.Unlock()
-}
-
-func (ct *ConnectionTracker) CleanupStale() int {
-	now := time.Now().UnixNano()
-	cleaned := 0
-	
-	for _, shard := range ct.shards {
-		var toDelete []string
-		var toClose []net.Conn
-		
-		shard.mu.RLock()
-		for id, info := range shard.connections {
-			lastSeen := atomic.LoadInt64(&info.lastSeen)
-			var timeout time.Duration
-			if info.connType == "tcp" {
-				timeout = tcpIdleTimeout
-			} else {
-				timeout = udpSessionTimeout
-			}
-			
-			if time.Duration(now-lastSeen) > timeout {
-				toDelete = append(toDelete, id)
-				toClose = append(toClose, info.conn)
-				cleaned++
-			}
-		}
-		shard.mu.RUnlock()
-		
-		// Close connections outside of lock
-		for _, conn := range toClose {
-			conn.Close()
-		}
-		
-		// Delete stale connections
-		if len(toDelete) > 0 {
-			shard.mu.Lock()
-			for _, id := range toDelete {
-				delete(shard.connections, id)
-			}
-			shard.mu.Unlock()
-		}
-	}
-	
-	if cleaned > 0 {
-		log.Printf("Cleaned up %d stale connections", cleaned)
-	}
-	
-	return cleaned
-}
-
-func (ct *ConnectionTracker) Stats() (int, int) {
-	tcp, udp := 0, 0
-	
-	for _, shard := range ct.shards {
-		shard.mu.RLock()
-		for _, info := range shard.connections {
-			if info.connType == "tcp" {
-				tcp++
-			} else {
-				udp++
-			}
-		}
-		shard.mu.RUnlock()
-	}
-	
-	return tcp, udp
-}
-
-var globalConnTracker = NewConnectionTracker()
-
-// Worker pool for handling connections
-type WorkerPool struct {
-	taskQueue chan func()
-	workers   int32 // atomic
-	maxWorkers int32
-}
-
-func NewWorkerPool(maxWorkers int) *WorkerPool {
-	wp := &WorkerPool{
-		taskQueue:  make(chan func(), workerQueueSize),
-		maxWorkers: int32(maxWorkers),
-	}
-	
-	// Start initial workers
-	initialWorkers := runtime.NumCPU() * 2
-	if initialWorkers > maxWorkers {
-		initialWorkers = maxWorkers
-	}
-	
-	for i := 0; i < initialWorkers; i++ {
-		wp.startWorker()
-	}
-	
-	return wp
-}
-
-func (wp *WorkerPool) startWorker() {
-	if atomic.LoadInt32(&wp.workers) >= wp.maxWorkers {
-		return
-	}
-	
-	atomic.AddInt32(&wp.workers, 1)
-	go func() {
-		defer atomic.AddInt32(&wp.workers, -1)
-		
-		for task := range wp.taskQueue {
-			task()
-		}
-	}()
-}
-
-func (wp *WorkerPool) Submit(task func()) {
-	select {
-	case wp.taskQueue <- task:
-	default:
-		// Queue is full, try to start a new worker
-		wp.startWorker()
-		// Block until we can submit
-		wp.taskQueue <- task
-	}
-}
-
-func (wp *WorkerPool) Close() {
-	close(wp.taskQueue)
-}
-
-var globalWorkerPool = NewWorkerPool(maxWorkers)
-
-// UDPSession - optimized with reduced atomic operations
-type UDPSession struct {
-	stream      *smux.Stream
-	clientAddr  *net.UDPAddr
-	lastSeen    int64 // atomic: Unix nanoseconds
-	cancel      context.CancelFunc
-	mu          sync.RWMutex
-	closed      int32 // atomic: 0 = open, 1 = closed
-	connID      string
-	localActive int64 // local cache for activity
-}
-
-func NewUDPSession(stream *smux.Stream, clientAddr *net.UDPAddr, connID string) *UDPSession {
-	now := time.Now().UnixNano()
-	return &UDPSession{
-		stream:      stream,
-		clientAddr:  clientAddr,
-		lastSeen:    now,
-		closed:      0,
-		connID:      connID,
-		localActive: now,
-	}
-}
-
-func (us *UDPSession) UpdateActivity() {
-	if atomic.LoadInt32(&us.closed) == 0 {
-		now := time.Now().UnixNano()
-		us.localActive = now
-		// Batch update to reduce atomic operations
-		if now-atomic.LoadInt64(&us.lastSeen) > int64(batchUpdateInterval) {
-			atomic.StoreInt64(&us.lastSeen, now)
-			globalConnTracker.Update(us.connID)
-		}
-	}
-}
-
-func (us *UDPSession) IsStale() bool {
-	if atomic.LoadInt32(&us.closed) == 1 {
-		return true
-	}
-	// Use local cache first
-	if time.Duration(time.Now().UnixNano()-us.localActive) > udpSessionTimeout {
-		lastSeen := atomic.LoadInt64(&us.lastSeen)
-		return time.Duration(time.Now().UnixNano()-lastSeen) > udpSessionTimeout
-	}
-	return false
-}
-
-func (us *UDPSession) SetCancel(cancel context.CancelFunc) {
-	us.mu.Lock()
-	us.cancel = cancel
-	us.mu.Unlock()
-}
-
-func (us *UDPSession) Close() {
-	if atomic.CompareAndSwapInt32(&us.closed, 0, 1) {
-		us.mu.Lock()
-		if us.cancel != nil {
-			us.cancel()
-		}
-		if us.stream != nil {
-			us.stream.Close()
-		}
-		us.mu.Unlock()
-		globalConnTracker.Remove(us.connID)
-	}
-}
-
-func (us *UDPSession) IsClosed() bool {
-	return atomic.LoadInt32(&us.closed) == 1
-}
-
-func (us *UDPSession) Write(data []byte) error {
-	us.mu.RLock()
-	defer us.mu.RUnlock()
-	
-	if atomic.LoadInt32(&us.closed) == 1 {
-		return fmt.Errorf("session closed")
-	}
-	
-	// Apply bandwidth limiting
-	if limiter := globalConnTracker.GetLimiter(us.connID); limiter != nil {
-		limiter.uploadLimiter.WaitForTokens(int64(len(data)))
-	}
-	
-	// Use cached deadline setting
-	us.stream.SetWriteDeadline(time.Now().Add(udpOperationTimeout))
-	_, err := us.stream.Write(data)
-	return err
-}
-
-// Sharded UDP forwarder for better concurrency
-type UDPSessionShard struct {
-	mu       sync.RWMutex
-	sessions map[string]*UDPSession
+type Session struct {
+        muxSession *smux.Session
+        tcpPorts   []string
+        udpPorts   []string
+        token      string
+        ctx        context.Context
+        cancel     context.CancelFunc
+        tcpListeners []net.Listener
+        udpConns    []*net.UDPConn
+        udpForwarders []*UDPForwarder
+        lastActive atomic.Int64
 }
 
 type UDPForwarder struct {
-	shards      [numShards]*UDPSessionShard
-	session     *smux.Session
-	mu          sync.RWMutex
-	cleanupLock sync.Mutex
+        sessions sync.Map // string -> *UDPSession
+        session  *smux.Session
+        port     string
+        udpConn  *net.UDPConn
 }
 
-func NewUDPForwarder(session *smux.Session) *UDPForwarder {
-	uf := &UDPForwarder{
-		session: session,
-	}
-	for i := 0; i < numShards; i++ {
-		uf.shards[i] = &UDPSessionShard{
-			sessions: make(map[string]*UDPSession),
-		}
-	}
-	return uf
+type UDPSession struct {
+        stream     *smux.Stream
+        clientAddr *net.UDPAddr
+        lastSeen   time.Time
+        mu         sync.RWMutex
+        limiter    *rate.Limiter
 }
 
-func (uf *UDPForwarder) getShard(sessionKey string) *UDPSessionShard {
-	h := fnv.New32a()
-	h.Write([]byte(sessionKey))
-	return uf.shards[h.Sum32()&shardMask]
+func (us *UDPSession) UpdateActivity() {
+        us.mu.Lock()
+        us.lastSeen = time.Now()
+        us.mu.Unlock()
 }
 
-func (uf *UDPForwarder) GetOrCreateSession(sessionKey string, clientAddr *net.UDPAddr, targetPort uint16) (*UDPSession, error) {
-	shard := uf.getShard(sessionKey)
-	
-	// First try to get existing session
-	shard.mu.RLock()
-	if session, exists := shard.sessions[sessionKey]; exists {
-		if !session.IsClosed() {
-			shard.mu.RUnlock()
-			return session, nil
-		}
-	}
-	shard.mu.RUnlock()
-
-	// Need to create new session
-	uf.mu.Lock()
-	defer uf.mu.Unlock()
-
-	// Double-check after acquiring lock
-	shard.mu.Lock()
-	defer shard.mu.Unlock()
-	
-	if session, exists := shard.sessions[sessionKey]; exists {
-		if !session.IsClosed() {
-			return session, nil
-		}
-		delete(shard.sessions, sessionKey)
-	}
-
-	// Create new session
-	stream, err := uf.session.OpenStream()
-	if err != nil {
-		return nil, fmt.Errorf("failed to open stream: %v", err)
-	}
-
-	// Send binary protocol header using pool
-	header := protocolHeaderPool.Get().(*ProtocolHeader)
-	header.Protocol = protocolUDP
-	header.Port = targetPort
-	
-	stream.SetWriteDeadline(time.Now().Add(udpOperationTimeout))
-	_, err = stream.Write(header.Encode())
-	protocolHeaderPool.Put(header)
-	
-	if err != nil {
-		stream.Close()
-		return nil, fmt.Errorf("failed to write protocol header: %v", err)
-	}
-
-	// Create a dummy connection for tracking
-	dummyConn := &dummyUDPConn{addr: clientAddr}
-	connID := globalConnTracker.Add(dummyConn, "udp")
-
-	session := NewUDPSession(stream, clientAddr, connID)
-	shard.sessions[sessionKey] = session
-
-	return session, nil
+func (us *UDPSession) IsStale() bool {
+        us.mu.RLock()
+        defer us.mu.RUnlock()
+        return time.Since(us.lastSeen) > idleTimeout
 }
 
-type dummyUDPConn struct {
-	addr *net.UDPAddr
+func NewRelayServer(config *Config) *RelayServer {
+        return &RelayServer{
+                config: config,
+        }
 }
 
-func (d *dummyUDPConn) Read(b []byte) (n int, err error)   { return 0, fmt.Errorf("not implemented") }
-func (d *dummyUDPConn) Write(b []byte) (n int, err error) { return 0, fmt.Errorf("not implemented") }
-func (d *dummyUDPConn) Close() error                      { return nil }
-func (d *dummyUDPConn) LocalAddr() net.Addr               { return d.addr }
-func (d *dummyUDPConn) RemoteAddr() net.Addr              { return d.addr }
-func (d *dummyUDPConn) SetDeadline(t time.Time) error     { return nil }
-func (d *dummyUDPConn) SetReadDeadline(t time.Time) error { return nil }
-func (d *dummyUDPConn) SetWriteDeadline(t time.Time) error { return nil }
+func (r *RelayServer) Start() error {
+        listener, err := net.Listen("tcp", ":"+r.config.Port)
+        if err != nil {
+                return fmt.Errorf("failed to listen: %v", err)
+        }
+        defer listener.Close()
 
-func (uf *UDPForwarder) CleanupStaleSessions() int {
-	uf.cleanupLock.Lock()
-	defer uf.cleanupLock.Unlock()
+        if r.config.limitBytesPerSec > 0 {
+                log.Printf("Relay: listening on port %s with %d bytes/sec per-connection limit",
+                        r.config.Port, r.config.limitBytesPerSec)
+        } else {
+                log.Printf("Relay: listening on port %s (no bandwidth limit)", r.config.Port)
+        }
 
-	cleaned := 0
-	for _, shard := range uf.shards {
-		var toDelete []string
-		var sessions []*UDPSession
-
-		shard.mu.RLock()
-		for sessionKey, session := range shard.sessions {
-			if session.IsStale() {
-				toDelete = append(toDelete, sessionKey)
-				sessions = append(sessions, session)
-			}
-		}
-		shard.mu.RUnlock()
-
-		if len(toDelete) > 0 {
-			// Close sessions outside of lock
-			for _, session := range sessions {
-				session.Close()
-			}
-			
-			shard.mu.Lock()
-			for _, key := range toDelete {
-				delete(shard.sessions, key)
-			}
-			shard.mu.Unlock()
-			
-			cleaned += len(toDelete)
-		}
-	}
-
-	if cleaned > 0 {
-		log.Printf("Cleaned up %d stale UDP sessions", cleaned)
-	}
-
-	return cleaned
+        for {
+                conn, err := listener.Accept()
+                if err != nil {
+                        log.Printf("Relay: accept error: %v", err)
+                        continue
+                }
+                go r.handleConnection(conn)
+        }
 }
 
-func (uf *UDPForwarder) Shutdown() {
-	uf.cleanupLock.Lock()
-	defer uf.cleanupLock.Unlock()
+func (r *RelayServer) handleConnection(conn net.Conn) {
+        defer conn.Close()
 
-	totalSessions := 0
-	for _, shard := range uf.shards {
-		var sessions []*UDPSession
-		var keys []string
+        // Tune TCP connection for maximum throughput
+        if err := tuneTCPConn(conn); err != nil {
+                log.Printf("Relay: failed to tune TCP connection: %v", err)
+        }
 
-		shard.mu.Lock()
-		for sessionKey, session := range shard.sessions {
-			keys = append(keys, sessionKey)
-			sessions = append(sessions, session)
-		}
-		
-		// Close all sessions
-		for i, key := range keys {
-			sessions[i].Close()
-			delete(shard.sessions, key)
-		}
-		shard.mu.Unlock()
-		
-		totalSessions += len(sessions)
-	}
+        // Set read deadline for handshake
+        conn.SetReadDeadline(time.Now().Add(10 * time.Second))
 
-	log.Printf("Shutdown: closed %d UDP sessions", totalSessions)
+        // Create smux session first
+        smuxConfig := smux.DefaultConfig()
+        smuxConfig.Version = smuxVersion
+        smuxConfig.MaxFrameSize = smuxMaxFrameSize
+        smuxConfig.MaxReceiveBuffer = smuxMaxReceiveBuffer
+        smuxConfig.KeepAliveInterval = keepAliveInterval
+        smuxConfig.KeepAliveTimeout = keepAliveInterval * 2
+
+        muxSession, err := smux.Server(conn, smuxConfig)
+        if err != nil {
+                log.Printf("Relay: failed to create smux session: %v", err)
+                return
+        }
+        defer muxSession.Close()
+
+        // Accept control stream for handshake
+        controlStream, err := muxSession.AcceptStream()
+        if err != nil {
+                log.Printf("Relay: failed to accept control stream: %v", err)
+                return
+        }
+
+        reader := bufio.NewReader(controlStream)
+
+        // Read token
+        tokenLine, err := reader.ReadString('\n')
+        if err != nil {
+                controlStream.Close()
+                log.Printf("Relay: failed to read token: %v", err)
+                return
+        }
+        receivedToken := strings.TrimSpace(tokenLine)
+
+        // Read forward ports
+        forwardLine, err := reader.ReadString('\n')
+        if err != nil {
+                controlStream.Close()
+                log.Printf("Relay: failed to read forward ports: %v", err)
+                return
+        }
+        forwardPortsStr := strings.TrimSpace(forwardLine)
+
+        // Read forward UDP ports
+        forwardUDPLine, err := reader.ReadString('\n')
+        if err != nil {
+                controlStream.Close()
+                log.Printf("Relay: failed to read forward UDP ports: %v", err)
+                return
+        }
+        forwardUDPPortsStr := strings.TrimSpace(forwardUDPLine)
+
+        controlStream.Close()
+
+        // Validate token
+        if receivedToken != r.config.Token {
+                log.Printf("Relay: invalid token from %s", conn.RemoteAddr())
+                return
+        }
+
+        // Parse ports
+        tcpPorts, err := parsePorts(forwardPortsStr)
+        if err != nil {
+                log.Printf("Relay: invalid TCP forward ports: %v", err)
+                return
+        }
+
+        udpPorts, err := parsePorts(forwardUDPPortsStr)
+        if err != nil {
+                log.Printf("Relay: invalid UDP forward ports: %v", err)
+                return
+        }
+
+        if len(tcpPorts) == 0 && len(udpPorts) == 0 {
+                log.Printf("Relay: no forward ports specified")
+                return
+        }
+
+        // Remove read deadline
+        conn.SetReadDeadline(time.Time{})
+
+        log.Printf("Relay: authenticated connection, TCP ports: %v, UDP ports: %v", tcpPorts, udpPorts)
+
+        // Close existing session with same token if any
+        sessionKey := receivedToken
+        if oldSession, exists := r.sessions.Load(sessionKey); exists {
+                log.Printf("Relay: closing existing session for reconnection")
+                oldSession.(*Session).cancel()
+                r.sessions.Delete(sessionKey)
+        }
+
+        ctx, cancel := context.WithCancel(context.Background())
+        session := &Session{
+                muxSession: muxSession,
+                tcpPorts:   tcpPorts,
+                udpPorts:   udpPorts,
+                token:      receivedToken,
+                ctx:        ctx,
+                cancel:     cancel,
+        }
+        session.lastActive.Store(time.Now().Unix())
+
+        r.sessions.Store(sessionKey, session)
+
+        // Start TCP forwarding for each port
+        for _, port := range tcpPorts {
+                if err := r.startTCPForwarding(session, port); err != nil {
+                        log.Printf("Relay: failed to start TCP forwarding on port %s: %v", port, err)
+                        cancel()
+                        return
+                }
+        }
+
+        // Start UDP forwarding for each port
+        for _, port := range udpPorts {
+                if err := r.startUDPForwarding(session, port); err != nil {
+                        log.Printf("Relay: failed to start UDP forwarding on port %s: %v", port, err)
+                        cancel()
+                        return
+                }
+        }
+
+        // Monitor session health
+        go r.monitorSession(session, sessionKey)
+
+        // Wait for session to end
+        <-ctx.Done()
+
+        // Cleanup
+        r.cleanupSession(session, sessionKey)
 }
 
-// Binary protocol functions - optimized
-func (h *HandshakeMessage) Encode() []byte {
-	buf := new(bytes.Buffer)
-	buf.Grow(4 + len(h.Token) + 2 + len(h.TCPPorts)*2 + 2 + len(h.UDPPorts)*2)
-	
-	// Write token length and data
-	binary.Write(buf, binary.BigEndian, uint32(len(h.Token)))
-	buf.Write(h.Token)
-	
-	// Write TCP ports count and data
-	binary.Write(buf, binary.BigEndian, uint16(len(h.TCPPorts)))
-	for _, port := range h.TCPPorts {
-		binary.Write(buf, binary.BigEndian, port)
-	}
-	
-	// Write UDP ports count and data
-	binary.Write(buf, binary.BigEndian, uint16(len(h.UDPPorts)))
-	for _, port := range h.UDPPorts {
-		binary.Write(buf, binary.BigEndian, port)
-	}
-	
-	return buf.Bytes()
+func (r *RelayServer) startTCPForwarding(session *Session, port string) error {
+        listener, err := net.Listen("tcp", ":"+port)
+        if err != nil {
+                return err
+        }
+        session.tcpListeners = append(session.tcpListeners, listener)
+
+        log.Printf("Relay: TCP forwarding on port %s", port)
+
+        go func(l net.Listener, p string) {
+                defer l.Close()
+                for {
+                        select {
+                        case <-session.ctx.Done():
+                                return
+                        default:
+                        }
+
+                        conn, err := l.Accept()
+                        if err != nil {
+                                if session.ctx.Err() != nil {
+                                        return
+                                }
+                                log.Printf("Relay: TCP accept error on port %s: %v", p, err)
+                                continue
+                        }
+
+                        go r.handleTCPClient(session, conn, p)
+                }
+        }(listener, port)
+
+        return nil
 }
 
-func DecodeHandshakeMessage(data []byte) (*HandshakeMessage, error) {
-	buf := bytes.NewReader(data)
-	msg := handshakePool.Get().(*HandshakeMessage)
-	
-	// Reset the message
-	msg.Token = msg.Token[:0]
-	msg.TCPPorts = msg.TCPPorts[:0]
-	msg.UDPPorts = msg.UDPPorts[:0]
-	
-	// Read token
-	var tokenLen uint32
-	if err := binary.Read(buf, binary.BigEndian, &tokenLen); err != nil {
-		handshakePool.Put(msg)
-		return nil, fmt.Errorf("failed to read token length: %v", err)
-	}
-	
-	if cap(msg.Token) < int(tokenLen) {
-		msg.Token = make([]byte, tokenLen)
-	} else {
-		msg.Token = msg.Token[:tokenLen]
-	}
-	
-	if _, err := io.ReadFull(buf, msg.Token); err != nil {
-		handshakePool.Put(msg)
-		return nil, fmt.Errorf("failed to read token: %v", err)
-	}
-	
-	// Read TCP ports
-	var tcpCount uint16
-	if err := binary.Read(buf, binary.BigEndian, &tcpCount); err != nil {
-		handshakePool.Put(msg)
-		return nil, fmt.Errorf("failed to read TCP ports count: %v", err)
-	}
-	
-	if cap(msg.TCPPorts) < int(tcpCount) {
-		msg.TCPPorts = make([]uint16, tcpCount)
-	} else {
-		msg.TCPPorts = msg.TCPPorts[:tcpCount]
-	}
-	
-	for i := range msg.TCPPorts {
-		if err := binary.Read(buf, binary.BigEndian, &msg.TCPPorts[i]); err != nil {
-			handshakePool.Put(msg)
-			return nil, fmt.Errorf("failed to read TCP port %d: %v", i, err)
-		}
-	}
-	
-	// Read UDP ports
-	var udpCount uint16
-	if err := binary.Read(buf, binary.BigEndian, &udpCount); err != nil {
-		handshakePool.Put(msg)
-		return nil, fmt.Errorf("failed to read UDP ports count: %v", err)
-	}
-	
-	if cap(msg.UDPPorts) < int(udpCount) {
-		msg.UDPPorts = make([]uint16, udpCount)
-	} else {
-		msg.UDPPorts = msg.UDPPorts[:udpCount]
-	}
-	
-	for i := range msg.UDPPorts {
-		if err := binary.Read(buf, binary.BigEndian, &msg.UDPPorts[i]); err != nil {
-			handshakePool.Put(msg)
-			return nil, fmt.Errorf("failed to read UDP port %d: %v", i, err)
-		}
-	}
-	
-	return msg, nil
+func (r *RelayServer) handleTCPClient(session *Session, conn net.Conn, port string) {
+        defer conn.Close()
+
+        // Tune TCP connection
+        tuneTCPConn(conn)
+
+        session.lastActive.Store(time.Now().Unix())
+
+        // Open stream through tunnel
+        stream, err := session.muxSession.OpenStream()
+        if err != nil {
+                log.Printf("Relay: failed to open stream: %v", err)
+                return
+        }
+        defer stream.Close()
+
+        // Send protocol message with port
+        protocolMsg := fmt.Sprintf("TCP:%s\n", port)
+        _, err = stream.Write([]byte(protocolMsg))
+        if err != nil {
+                log.Printf("Relay: failed to write protocol message: %v", err)
+                return
+        }
+
+        // Apply rate limiting to each connection
+        limitedConn := io.ReadWriter(conn)
+        limitedStream := io.ReadWriter(stream)
+
+        if r.config.limitBytesPerSec > 0 {
+                // Limit both directions independently
+                limitedConnReader := NewRateLimitedReader(conn, r.config.limitBytesPerSec)
+                limitedConnWriter := NewRateLimitedWriter(conn, r.config.limitBytesPerSec)
+                limitedStreamReader := NewRateLimitedReader(stream, r.config.limitBytesPerSec)
+                limitedStreamWriter := NewRateLimitedWriter(stream, r.config.limitBytesPerSec)
+
+                limitedConn = struct {
+                        io.Reader
+                        io.Writer
+                }{limitedConnReader, limitedConnWriter}
+
+                limitedStream = struct {
+                        io.Reader
+                        io.Writer
+                }{limitedStreamReader, limitedStreamWriter}
+        }
+
+        // Bidirectional copy with buffer pooling
+        done := make(chan error, 2)
+
+        go func() {
+                bufPtr := bufferPool.Get().(*[]byte)
+                defer bufferPool.Put(bufPtr)
+                _, err := io.CopyBuffer(limitedStream, limitedConn, *bufPtr)
+                stream.Close() // Close write side to signal EOF
+                done <- err
+        }()
+
+        go func() {
+                bufPtr := bufferPool.Get().(*[]byte)
+                defer bufferPool.Put(bufPtr)
+                _, err := io.CopyBuffer(limitedConn, limitedStream, *bufPtr)
+                conn.Close() // Close write side to signal EOF
+                done <- err
+        }()
+
+        // Wait for both directions to complete
+        <-done
+        <-done
 }
 
-func (p *ProtocolHeader) Encode() []byte {
-	buf := make([]byte, protocolHeaderSize)
-	buf[0] = p.Protocol
-	binary.BigEndian.PutUint16(buf[1:3], p.Port)
-	return buf
+func (r *RelayServer) startUDPForwarding(session *Session, port string) error {
+        addr, err := net.ResolveUDPAddr("udp", ":"+port)
+        if err != nil {
+                return err
+        }
+
+        conn, err := net.ListenUDP("udp", addr)
+        if err != nil {
+                return err
+        }
+
+        // Set large UDP buffers
+        conn.SetReadBuffer(tcpReadBuffer)
+        conn.SetWriteBuffer(tcpWriteBuffer)
+
+        session.udpConns = append(session.udpConns, conn)
+
+        forwarder := &UDPForwarder{
+                session: session.muxSession,
+                port:    port,
+                udpConn: conn,
+        }
+        session.udpForwarders = append(session.udpForwarders, forwarder)
+
+        log.Printf("Relay: UDP forwarding on port %s", port)
+
+        go r.handleUDPRelay(session.ctx, conn, forwarder, port)
+        go r.cleanupUDPSessions(session.ctx, forwarder)
+
+        return nil
 }
 
-func DecodeProtocolHeader(data []byte) (*ProtocolHeader, error) {
-	if len(data) < protocolHeaderSize {
-		return nil, fmt.Errorf("insufficient data for protocol header")
-	}
-	
-	header := protocolHeaderPool.Get().(*ProtocolHeader)
-	header.Protocol = data[0]
-	header.Port = binary.BigEndian.Uint16(data[1:3])
-	return header, nil
+func (r *RelayServer) handleUDPRelay(ctx context.Context, udpListener *net.UDPConn, forwarder *UDPForwarder, targetPort string) {
+        defer udpListener.Close()
+        
+        buffer := udpBufferPool.Get().(*[]byte)
+        defer udpBufferPool.Put(buffer)
+
+        for {
+                select {
+                case <-ctx.Done():
+                        log.Printf("Relay: UDP listener on port %s shutting down", targetPort)
+                        return
+                default:
+                }
+
+                udpListener.SetReadDeadline(time.Now().Add(1 * time.Second))
+                
+                n, clientAddr, err := udpListener.ReadFromUDP(*buffer)
+                if err != nil {
+                        if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+                                continue
+                        }
+                        
+                        select {
+                        case <-ctx.Done():
+                                return
+                        default:
+                                log.Printf("Relay: UDP read error on port %s: %v", targetPort, err)
+                                return
+                        }
+                }
+
+                sessionKey := fmt.Sprintf("%s:%s", clientAddr.String(), targetPort)
+
+                if sessionVal, exists := forwarder.sessions.Load(sessionKey); exists {
+                        session := sessionVal.(*UDPSession)
+                        session.UpdateActivity()
+                        
+                        // Apply rate limiting
+                        if session.limiter != nil {
+                                session.limiter.WaitN(context.Background(), n+2)
+                        }
+                        
+                        // Write length prefix
+                        lenBuf := make([]byte, 2)
+                        binary.BigEndian.PutUint16(lenBuf, uint16(n))
+                        session.stream.Write(lenBuf)
+                        session.stream.Write((*buffer)[:n])
+                        continue
+                }
+
+                // Create new UDP session
+                stream, err := forwarder.session.OpenStream()
+                if err != nil {
+                        continue
+                }
+
+                protocolMsg := fmt.Sprintf("UDP:%s\n", targetPort)
+                _, err = stream.Write([]byte(protocolMsg))
+                if err != nil {
+                        stream.Close()
+                        continue
+                }
+
+                // Create rate limiter for this UDP session
+                var limiter *rate.Limiter
+                if r.config.limitBytesPerSec > 0 {
+                        burst := int(r.config.limitBytesPerSec * 2)
+                        if burst < 1024*1024 {
+                                burst = 1024 * 1024
+                        }
+                        limiter = rate.NewLimiter(rate.Limit(r.config.limitBytesPerSec), burst)
+                }
+
+                udpSession := &UDPSession{
+                        stream:     stream,
+                        clientAddr: clientAddr,
+                        lastSeen:   time.Now(),
+                        limiter:    limiter,
+                }
+
+                forwarder.sessions.Store(sessionKey, udpSession)
+
+                // Start response handler
+                go func(s *UDPSession, key string) {
+                        defer func() {
+                                s.stream.Close()
+                                forwarder.sessions.Delete(key)
+                        }()
+
+                        lenBuf := make([]byte, 2)
+                        for {
+                                if _, err := io.ReadFull(s.stream, lenBuf); err != nil {
+                                        return
+                                }
+
+                                length := binary.BigEndian.Uint16(lenBuf)
+                                if length == 0 || length > udpBufferSize {
+                                        return
+                                }
+
+                                bufPtr := udpBufferPool.Get().(*[]byte)
+                                data := (*bufPtr)[:length]
+
+                                if _, err := io.ReadFull(s.stream, data); err != nil {
+                                        udpBufferPool.Put(bufPtr)
+                                        return
+                                }
+
+                                s.UpdateActivity()
+
+                                // Apply rate limiting
+                                if s.limiter != nil {
+                                        s.limiter.WaitN(context.Background(), len(data))
+                                }
+
+                                udpListener.WriteToUDP(data, s.clientAddr)
+                                udpBufferPool.Put(bufPtr)
+                        }
+                }(udpSession, sessionKey)
+
+                // Forward initial packet
+                udpSession.UpdateActivity()
+                
+                if limiter != nil {
+                        limiter.WaitN(context.Background(), n+2)
+                }
+                
+                lenBuf := make([]byte, 2)
+                binary.BigEndian.PutUint16(lenBuf, uint16(n))
+                stream.Write(lenBuf)
+                stream.Write((*buffer)[:n])
+        }
 }
 
-func parseBandwidth(bandwidthStr string) (int64, error) {
-	if bandwidthStr == "" {
-		return 0, nil
-	}
-	
-	bandwidthStr = strings.ToLower(strings.TrimSpace(bandwidthStr))
-	if bandwidthStr == "" {
-		return 0, nil
-	}
-	
-	var multiplier int64 = 1
-	var numStr string
-	
-	if strings.HasSuffix(bandwidthStr, "k") {
-		multiplier = 1000
-		numStr = bandwidthStr[:len(bandwidthStr)-1]
-	} else if strings.HasSuffix(bandwidthStr, "m") {
-		multiplier = 1000000
-		numStr = bandwidthStr[:len(bandwidthStr)-1]
-	} else if strings.HasSuffix(bandwidthStr, "g") {
-		multiplier = 1000000000
-		numStr = bandwidthStr[:len(bandwidthStr)-1]
-	} else {
-		numStr = bandwidthStr
-	}
-	
-	num, err := strconv.ParseFloat(numStr, 64)
-	if err != nil {
-		return 0, fmt.Errorf("invalid bandwidth format: %s", bandwidthStr)
-	}
-	
-	if num <= 0 {
-		return 0, fmt.Errorf("bandwidth must be positive: %s", bandwidthStr)
-	}
-	
-	return int64(num * float64(multiplier)), nil
+func (r *RelayServer) cleanupUDPSessions(ctx context.Context, forwarder *UDPForwarder) {
+        ticker := time.NewTicker(30 * time.Second)
+        defer ticker.Stop()
+        
+        for {
+                select {
+                case <-ctx.Done():
+                        return
+                case <-ticker.C:
+                        var toDelete []string
+                        
+                        forwarder.sessions.Range(func(key, value interface{}) bool {
+                                sessionKey := key.(string)
+                                session := value.(*UDPSession)
+                                
+                                if session.IsStale() {
+                                        toDelete = append(toDelete, sessionKey)
+                                        session.stream.Close()
+                                }
+                                
+                                return true
+                        })
+                        
+                        for _, key := range toDelete {
+                                forwarder.sessions.Delete(key)
+                        }
+                        
+                        if len(toDelete) > 0 {
+                                log.Printf("Relay: cleaned up %d stale UDP sessions on port %s", len(toDelete), forwarder.port)
+                        }
+                }
+        }
 }
 
-func main() {
-	mode := flag.String("mode", "", "Mode: relay or vpn")
-	host := flag.String("host", "", "Relay server host (used in vpn mode)")
-	port := flag.String("port", "", "Port to listen on (relay) or connect to (vpn)")
-	forward := flag.String("forward", "", "Local TCP ports to forward to, comma-separated (used in vpn mode)")
-	forwardudp := flag.String("forwardudp", "", "Local UDP ports to forward to, comma-separated (used in vpn mode)")
-	token := flag.String("token", "", "Pre-shared token required for tunnel auth (required)")
-	nonat := flag.Bool("nonat", false, "Use server's public IP as source for local connections (vpn mode only)")
-	limit := flag.String("limit", "", "Bandwidth limit per connection (e.g., 16m, 1g, 500k) - relay mode only")
-	flag.Parse()
+func (r *RelayServer) monitorSession(session *Session, sessionKey string) {
+        ticker := time.NewTicker(10 * time.Second)
+        defer ticker.Stop()
 
-	if *token == "" {
-		log.Fatal("You must provide -token on both sides")
-	}
-
-	// Parse bandwidth limit (only for relay mode)
-	if *mode == "relay" && *limit != "" {
-		var err error
-		globalBandwidthLimit, err = parseBandwidth(*limit)
-		if err != nil {
-			log.Fatalf("Invalid bandwidth limit: %v", err)
-		}
-		if globalBandwidthLimit > 0 {
-			log.Printf("Relay: bandwidth limit set to %d bits/second (%.2f Mbps) per connection", 
-				globalBandwidthLimit, float64(globalBandwidthLimit)/1000000.0)
-		}
-	}
-
-	// Start connection cleanup goroutine
-	go func() {
-		ticker := time.NewTicker(udpCleanupInterval)
-		defer ticker.Stop()
-		
-		for range ticker.C {
-			cleaned := globalConnTracker.CleanupStale()
-			if cleaned > 0 {
-				tcp, udp := globalConnTracker.Stats()
-				log.Printf("Cleaned up %d stale connections. Active: %d TCP, %d UDP", cleaned, tcp, udp)
-			}
-		}
-	}()
-
-	switch *mode {
-	case "relay":
-		if *port == "" {
-			log.Fatal("Relay mode requires -port")
-		}
-		runRelay(*port, *token)
-	case "vpn":
-		if *host == "" || *port == "" || (*forward == "" && *forwardudp == "") {
-			log.Fatal("VPN mode requires -host, -port, and at least one of -forward or -forwardudp")
-		}
-		runVPN(*host, *port, *forward, *forwardudp, *token, *nonat)
-	default:
-		log.Fatal("Invalid mode. Use -mode relay or -mode vpn")
-	}
+        for {
+                select {
+                case <-session.ctx.Done():
+                        return
+                case <-ticker.C:
+                        if session.muxSession.IsClosed() {
+                                log.Printf("Relay: detected closed session, cleaning up")
+                                session.cancel()
+                                return
+                        }
+                }
+        }
 }
 
-func configureTCPConnection(conn net.Conn) error {
-	tcpConn, ok := conn.(*net.TCPConn)
-	if !ok {
-		return nil
-	}
-	
-	if err := tcpConn.SetKeepAlive(true); err != nil {
-		return fmt.Errorf("failed to enable keepalive: %v", err)
-	}
-	
-	if err := tcpConn.SetKeepAlivePeriod(tcpKeepalive); err != nil {
-		return fmt.Errorf("failed to set keepalive period: %v", err)
-	}
-	
-	return nil
+func (r *RelayServer) cleanupSession(session *Session, sessionKey string) {
+        log.Printf("Relay: cleaning up session")
+
+        for _, listener := range session.tcpListeners {
+                listener.Close()
+        }
+
+        for _, conn := range session.udpConns {
+                conn.Close()
+        }
+
+        for _, forwarder := range session.udpForwarders {
+                forwarder.sessions.Range(func(key, value interface{}) bool {
+                        session := value.(*UDPSession)
+                        session.stream.Close()
+                        return true
+                })
+        }
+
+        session.muxSession.Close()
+        r.sessions.Delete(sessionKey)
+
+        log.Printf("Relay: session cleanup complete")
 }
 
-func parsePorts(portList string) ([]uint16, error) {
-	if portList == "" {
-		return nil, nil
-	}
-	
-	ports := strings.Split(portList, ",")
-	validPorts := make([]uint16, 0, len(ports))
-	
-	for _, port := range ports {
-		port = strings.TrimSpace(port)
-		if port == "" {
-			continue
-		}
-		
-		portNum, err := strconv.Atoi(port)
-		if err != nil || portNum < 1 || portNum > 65535 {
-			return nil, fmt.Errorf("invalid port number: %s", port)
-		}
-		
-		validPorts = append(validPorts, uint16(portNum))
-	}
-	
-	return validPorts, nil
+// VPNClient connects to relay and forwards traffic
+type VPNClient struct {
+        config     *Config
+        tcpPorts   []string
+        udpPorts   []string
+        tcpDialer  *net.Dialer
+        udpDialer  *net.Dialer
 }
 
-func runRelay(listenPort, expectedToken string) {
-	ln, err := net.Listen("tcp", ":"+listenPort)
-	if err != nil {
-		log.Fatalf("Relay: failed to listen on %s: %v", listenPort, err)
-	}
-	log.Printf("Relay: listening for tunnel on :%s", listenPort)
+func NewVPNClient(config *Config) (*VPNClient, error) {
+        tcpPorts, err := parsePorts(config.Forward)
+        if err != nil {
+                return nil, fmt.Errorf("invalid TCP forward ports: %v", err)
+        }
 
-	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			log.Printf("Relay: accept error: %v", err)
-			continue
-		}
+        udpPorts, err := parsePorts(config.ForwardUDP)
+        if err != nil {
+                return nil, fmt.Errorf("invalid UDP forward ports: %v", err)
+        }
 
-		if err := configureTCPConnection(conn); err != nil {
-			log.Printf("Relay: failed to configure connection: %v", err)
-			conn.Close()
-			continue
-		}
+        client := &VPNClient{
+                config:   config,
+                tcpPorts: tcpPorts,
+                udpPorts: udpPorts,
+        }
 
-		if atomic.LoadInt32(&tunnelActive) == 1 {
-			log.Printf("Relay: rejecting connection from %s - tunnel already active", conn.RemoteAddr())
-			conn.Close()
-			continue
-		}
+        // Setup dialers with public IP if -nonat is specified
+        if config.NoNAT {
+                _, tcpDialer, udpDialer, err := setupDialers()
+                if err != nil {
+                        log.Printf("VPN: failed to setup dialers: %v (will use default)", err)
+                } else {
+                        client.tcpDialer = tcpDialer
+                        client.udpDialer = udpDialer
+                }
+        }
 
-		log.Printf("Relay: incoming tunnel from %s", conn.RemoteAddr())
-		globalWorkerPool.Submit(func() {
-			handleTunnel(conn, expectedToken)
-		})
-	}
+        return client, nil
 }
 
-func handleTunnel(rawConn net.Conn, expectedToken string) {
-	defer rawConn.Close()
-	
-	defer func() {
-		atomic.StoreInt32(&tunnelActive, 0)
-		log.Printf("Relay: tunnel closed, cleared active state")
-	}()
+func (v *VPNClient) Start() error {
+        if v.config.limitBytesPerSec > 0 {
+                log.Printf("VPN: starting with %d bytes/sec per-connection limit", v.config.limitBytesPerSec)
+        } else {
+                log.Printf("VPN: starting (no bandwidth limit)")
+        }
 
-	session, err := smux.Server(rawConn, smux.DefaultConfig())
-	if err != nil {
-		log.Printf("Failed to create smux server: %v", err)
-		return
-	}
-	defer session.Close()
+        if v.config.NoNAT {
+                if v.tcpDialer != nil {
+                        log.Printf("VPN: using custom source IP for local connections")
+                } else {
+                        log.Printf("VPN: -nonat specified but custom dialers not available")
+                }
+        }
 
-	controlStream, err := session.AcceptStream()
-	if err != nil {
-		log.Printf("Failed to accept control stream: %v", err)
-		return
-	}
-	defer controlStream.Close()
-
-	var msgLen uint32
-	if err := binary.Read(controlStream, binary.BigEndian, &msgLen); err != nil {
-		log.Printf("Failed to read handshake length: %v", err)
-		return
-	}
-	
-	handshakeData := make([]byte, msgLen)
-	if _, err := io.ReadFull(controlStream, handshakeData); err != nil {
-		log.Printf("Failed to read handshake data: %v", err)
-		return
-	}
-
-	handshake, err := DecodeHandshakeMessage(handshakeData)
-	if err != nil {
-		log.Printf("Failed to decode handshake: %v", err)
-		return
-	}
-	defer handshakePool.Put(handshake)
-
-	if !constantTimeEqual(string(handshake.Token), expectedToken) {
-		log.Printf("Relay: invalid token from %s", rawConn.RemoteAddr())
-		return
-	}
-
-	if len(handshake.TCPPorts) == 0 && len(handshake.UDPPorts) == 0 {
-		log.Printf("No forward ports specified")
-		return
-	}
-
-	atomic.StoreInt32(&tunnelActive, 1)
-	log.Printf("Relay: authenticated tunnel - TCP:%v UDP:%v", handshake.TCPPorts, handshake.UDPPorts)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	var listeners []net.Listener
-	var udpForwarders []*UDPForwarder
-	defer func() {
-		log.Printf("Relay: cleaning up %d TCP listeners and %d UDP forwarders", len(listeners), len(udpForwarders))
-		for _, listener := range listeners {
-			listener.Close()
-		}
-		for _, forwarder := range udpForwarders {
-			forwarder.Shutdown()
-		}
-	}()
-
-	for _, port := range handshake.TCPPorts {
-		portStr := fmt.Sprintf("%d", port)
-		listener, err := net.Listen("tcp", ":"+portStr)
-		if err != nil {
-			log.Printf("Failed to listen on TCP port %d: %v", port, err)
-			return
-		}
-		listeners = append(listeners, listener)
-		log.Printf("Relay: listening on :%d for TCP clients", port)
-
-		go func(l net.Listener, p uint16) {
-			defer l.Close()
-			for {
-				select {
-				case <-ctx.Done():
-					log.Printf("Relay: TCP listener on port %d shutting down", p)
-					return
-				default:
-				}
-
-				clientConn, err := l.Accept()
-				if err != nil {
-					select {
-					case <-ctx.Done():
-						return
-					default:
-						log.Printf("Relay: TCP accept error on port %d: %v", p, err)
-						return
-					}
-				}
-
-				if err := configureTCPConnection(clientConn); err != nil {
-					log.Printf("Failed to configure client connection: %v", err)
-					clientConn.Close()
-					continue
-				}
-
-				globalWorkerPool.Submit(func() {
-					handleClientWithContext(ctx, clientConn, p, session)
-				})
-			}
-		}(listener, port)
-	}
-
-	for _, port := range handshake.UDPPorts {
-		portStr := fmt.Sprintf("%d", port)
-		udpAddr, err := net.ResolveUDPAddr("udp", ":"+portStr)
-		if err != nil {
-			log.Printf("Failed to resolve UDP address :%d: %v", port, err)
-			return
-		}
-		udpListener, err := net.ListenUDP("udp", udpAddr)
-		if err != nil {
-			log.Printf("Failed to listen on UDP port %d: %v", port, err)
-			return
-		}
-		log.Printf("Relay: listening on :%d for UDP clients", port)
-
-		udpForwarder := NewUDPForwarder(session)
-		udpForwarders = append(udpForwarders, udpForwarder)
-		
-		go handleUDPRelayWithContext(ctx, udpListener, udpForwarder, port)
-		go cleanupUDPSessionsWithContext(ctx, udpForwarder)
-	}
-
-	go func() {
-		for !session.IsClosed() {
-			stream, err := session.AcceptStream()
-			if err != nil {
-				log.Printf("Relay: session accept failed (%v), cancelling tunnel", err)
-				cancel()
-				break
-			}
-			
-			if stream != nil {
-				globalWorkerPool.Submit(func() {
-					handleUnexpectedStream(stream)
-				})
-			}
-		}
-	}()
-
-	<-ctx.Done()
-	log.Printf("Relay: tunnel context cancelled, cleaning up")
+        for {
+                if err := v.connect(); err != nil {
+                        log.Printf("VPN: connection error: %v, reconnecting in %v", err, reconnectDelay)
+                        time.Sleep(reconnectDelay)
+                        continue
+                }
+        }
 }
 
-func handleUnexpectedStream(s *smux.Stream) {
-	defer s.Close()
-	
-	headerData := make([]byte, protocolHeaderSize)
-	if _, err := io.ReadFull(s, headerData); err != nil {
-		return
-	}
-	
-	header, err := DecodeProtocolHeader(headerData)
-	if err != nil {
-		log.Printf("Relay: failed to decode protocol header: %v", err)
-		return
-	}
-	defer protocolHeaderPool.Put(header)
-	
-	log.Printf("Relay: unexpected stream %d:%d", header.Protocol, header.Port)
+func (v *VPNClient) connect() error {
+        conn, err := net.Dial("tcp", v.config.Host)
+        if err != nil {
+                return fmt.Errorf("dial failed: %v", err)
+        }
+        defer conn.Close()
+
+        // Tune TCP connection for maximum throughput
+        if err := tuneTCPConn(conn); err != nil {
+                log.Printf("VPN: failed to tune TCP connection: %v", err)
+        }
+
+        log.Printf("VPN: connected to relay %s", v.config.Host)
+
+        // Create smux client with optimized config
+        smuxConfig := smux.DefaultConfig()
+        smuxConfig.Version = smuxVersion
+        smuxConfig.MaxFrameSize = smuxMaxFrameSize
+        smuxConfig.MaxReceiveBuffer = smuxMaxReceiveBuffer
+        smuxConfig.KeepAliveInterval = keepAliveInterval
+        smuxConfig.KeepAliveTimeout = keepAliveInterval * 2
+
+        muxSession, err := smux.Client(conn, smuxConfig)
+        if err != nil {
+                return fmt.Errorf("smux client failed: %v", err)
+        }
+        defer muxSession.Close()
+
+        // Send handshake
+        ctrl, err := muxSession.OpenStream()
+        if err != nil {
+                return fmt.Errorf("failed to open control stream: %v", err)
+        }
+
+        handshakeMsg := fmt.Sprintf("%s\n%s\n%s\n", v.config.Token, v.config.Forward, v.config.ForwardUDP)
+        _, err = ctrl.Write([]byte(handshakeMsg))
+        if err != nil {
+                ctrl.Close()
+                return fmt.Errorf("handshake failed: %v", err)
+        }
+        ctrl.Close()
+
+        log.Printf("VPN: tunnel established, TCP ports: %v, UDP ports: %v", v.tcpPorts, v.udpPorts)
+
+        // Handle incoming streams
+        ctx, cancel := context.WithCancel(context.Background())
+        defer cancel()
+
+        errCh := make(chan error, 1)
+
+        go func() {
+                for {
+                        stream, err := muxSession.AcceptStream()
+                        if err != nil {
+                                errCh <- err
+                                return
+                        }
+                        go v.handleStream(ctx, stream)
+                }
+        }()
+
+        // Monitor connection health
+        ticker := time.NewTicker(10 * time.Second)
+        defer ticker.Stop()
+
+        for {
+                select {
+                case err := <-errCh:
+                        return err
+                case <-ticker.C:
+                        if muxSession.IsClosed() {
+                                return fmt.Errorf("connection closed")
+                        }
+                }
+        }
 }
 
-func cleanupUDPSessionsWithContext(ctx context.Context, forwarder *UDPForwarder) {
-	ticker := time.NewTicker(udpCleanupInterval)
-	defer ticker.Stop()
-	
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			forwarder.CleanupStaleSessions()
-		}
-	}
-}
+func (v *VPNClient) handleStream(ctx context.Context, stream *smux.Stream) {
+        defer stream.Close()
 
-func handleClientWithContext(ctx context.Context, clientConn net.Conn, port uint16, session *smux.Session) {
-	defer clientConn.Close()
+        // Read protocol message
+        reader := bufio.NewReader(stream)
+        protoLine, err := reader.ReadString('\n')
+        if err != nil {
+                log.Printf("VPN: failed to read protocol line: %v", err)
+                return
+        }
+        protoLine = strings.TrimSpace(protoLine)
 
-	select {
-	case <-ctx.Done():
-		return
-	default:
-	}
+        parts := strings.SplitN(protoLine, ":", 2)
+        if len(parts) != 2 {
+                log.Printf("VPN: invalid protocol line: %s", protoLine)
+                return
+        }
 
-	connID := globalConnTracker.Add(clientConn, "tcp")
-	defer globalConnTracker.Remove(connID)
+        protocol := parts[0]
+        targetPort := parts[1]
 
-	stream, err := session.OpenStream()
-	if err != nil {
-		log.Printf("Failed to open stream: %v", err)
-		return
-	}
-	defer stream.Close()
-
-	header := protocolHeaderPool.Get().(*ProtocolHeader)
-	header.Protocol = protocolTCP
-	header.Port = port
-	
-	_, err = stream.Write(header.Encode())
-	protocolHeaderPool.Put(header)
-	
-	if err != nil {
-		log.Printf("Failed to write protocol header: %v", err)
-		return
-	}
-
-	proxyPairOptimizedWithTrackingAndContext(ctx, clientConn, stream, connID)
-}
-
-func handleUDPRelayWithContext(ctx context.Context, udpListener *net.UDPConn, forwarder *UDPForwarder, targetPort uint16) {
-	defer udpListener.Close()
-	
-	buffer := udpBufferPool.Get().([]byte)
-	defer udpBufferPool.Put(buffer)
-
-	for {
-		select {
-		case <-ctx.Done():
-			log.Printf("Relay: UDP listener on port %d shutting down", targetPort)
-			return
-		default:
-		}
-
-		udpListener.SetReadDeadline(time.Now().Add(1 * time.Second))
-		
-		n, clientAddr, err := udpListener.ReadFromUDP(buffer)
-		if err != nil {
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				continue
-			}
-			
-			select {
-			case <-ctx.Done():
-				return
-			default:
-				log.Printf("UDP read error on port %d: %v", targetPort, err)
-				return
-			}
-		}
-
-		sessionKey := fmt.Sprintf("%s:%d", clientAddr.String(), targetPort)
-
-		session, err := forwarder.GetOrCreateSession(sessionKey, clientAddr, targetPort)
-		if err != nil {
-			log.Printf("Failed to get/create UDP session: %v", err)
-			continue
-		}
-
-		session.UpdateActivity()
-		if err := session.Write(buffer[:n]); err != nil {
-			log.Printf("Failed to write to UDP session: %v", err)
-			continue
-		}
-
-		if session.cancel == nil {
-			respCtx, respCancel := context.WithCancel(ctx)
-			session.SetCancel(respCancel)
-			
-			globalWorkerPool.Submit(func() {
-				handleUDPResponse(respCtx, session, udpListener, sessionKey, forwarder)
-			})
-		}
-	}
-}
-
-func handleUDPResponse(ctx context.Context, session *UDPSession, udpListener *net.UDPConn, sessionKey string, forwarder *UDPForwarder) {
-	defer func() {
-		session.Close()
-		shard := forwarder.getShard(sessionKey)
-		shard.mu.Lock()
-		delete(shard.sessions, sessionKey)
-		shard.mu.Unlock()
-	}()
-
-	buffer := udpBufferPool.Get().([]byte)
-	defer udpBufferPool.Put(buffer)
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-
-		if session.IsClosed() {
-			return
-		}
-
-		session.stream.SetReadDeadline(time.Now().Add(udpOperationTimeout))
-		
-		n, err := session.stream.Read(buffer)
-		if err != nil {
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				if session.IsStale() {
-					return
-				}
-				continue
-			}
-			return
-		}
-
-		if limiter := globalConnTracker.GetLimiter(session.connID); limiter != nil {
-			limiter.downloadLimiter.WaitForTokens(int64(n))
-		}
-
-		_, err = udpListener.WriteToUDP(buffer[:n], session.clientAddr)
-		if err != nil {
-			return
-		}
-		
-		session.UpdateActivity()
-	}
-}
-
-func getPublicIP() (net.IP, error) {
-	conn, err := net.Dial("udp", "8.8.8.8:80")
-	if err != nil {
-		return nil, err
-	}
-	defer conn.Close()
-
-	localAddr := conn.LocalAddr().(*net.UDPAddr)
-	return localAddr.IP, nil
-}
-
-func setupDialers() (net.IP, *net.Dialer, *net.Dialer, error) {
-	publicIP, err := getPublicIP()
-	if err != nil {
-		return nil, nil, nil, fmt.Errorf("failed to get public IP: %v", err)
-	}
-
-	log.Printf("VPN: using source IP %s for local connections", publicIP)
-
-	tcpDialer := &net.Dialer{
-		LocalAddr: &net.TCPAddr{IP: publicIP},
-		Timeout:   30 * time.Second,
-	}
-
-	udpDialer := &net.Dialer{
-		LocalAddr: &net.UDPAddr{IP: publicIP},
-		Timeout:   30 * time.Second,
-	}
-
-	return publicIP, tcpDialer, udpDialer, nil
-}
-
-func runVPN(relayHost, relayPort, forwardPorts, forwardUDPPorts, token string, nonat bool) {
-	relayAddr := net.JoinHostPort(relayHost, relayPort)
-
-	tcpPorts, err := parsePorts(forwardPorts)
-	if err != nil {
-		log.Fatalf("VPN: invalid TCP forward ports: %v", err)
-	}
-
-	udpPorts, err := parsePorts(forwardUDPPorts)
-	if err != nil {
-		log.Fatalf("VPN: invalid UDP forward ports: %v", err)
-	}
-
-	var tcpDialer, udpDialer *net.Dialer
-
-	if nonat {
-		_, tcpDialer, udpDialer, err = setupDialers()
-		if err != nil {
-			log.Fatalf("VPN: failed to setup dialers: %v", err)
-		}
-	}
-
-	handshake := handshakePool.Get().(*HandshakeMessage)
-	handshake.Token = []byte(token)
-	handshake.TCPPorts = tcpPorts
-	handshake.UDPPorts = udpPorts
-	handshakeData := handshake.Encode()
-	handshakePool.Put(handshake)
-
-	for {
-		log.Printf("VPN: dialing relay %s", relayAddr)
-		relayConn, err := net.Dial("tcp", relayAddr)
-		if err != nil {
-			log.Printf("VPN: failed to connect: %v", err)
-			time.Sleep(5 * time.Second)
-			continue
-		}
-
-		if err := configureTCPConnection(relayConn); err != nil {
-			log.Printf("VPN: failed to configure relay connection: %v", err)
-			relayConn.Close()
-			time.Sleep(5 * time.Second)
-			continue
-		}
-
-		session, err := smux.Client(relayConn, smux.DefaultConfig())
-		if err != nil {
-			relayConn.Close()
-			log.Printf("VPN: failed to create smux client: %v", err)
-			time.Sleep(5 * time.Second)
-			continue
-		}
-
-		ctrl, err := session.OpenStream()
-		if err != nil {
-			session.Close()
-			relayConn.Close()
-			log.Printf("VPN: failed to open control stream: %v", err)
-			time.Sleep(5 * time.Second)
-			continue
-		}
-
-		if err := binary.Write(ctrl, binary.BigEndian, uint32(len(handshakeData))); err != nil {
-			ctrl.Close()
-			session.Close()
-			relayConn.Close()
-			log.Printf("VPN: failed to send handshake length: %v", err)
-			time.Sleep(5 * time.Second)
-			continue
-		}
-
-		if _, err := ctrl.Write(handshakeData); err != nil {
-			ctrl.Close()
-			session.Close()
-			relayConn.Close()
-			log.Printf("VPN: failed to send handshake: %v", err)
-			time.Sleep(5 * time.Second)
-			continue
-		}
-		ctrl.Close()
-
-		log.Printf("VPN: session established - TCP:%v UDP:%v", tcpPorts, udpPorts)
-
-		for {
-			stream, err := session.AcceptStream()
-			if err != nil {
-				log.Printf("VPN: session accept error: %v", err)
-				break
-			}
-			globalWorkerPool.Submit(func() {
-				handleVPNStream(stream, tcpPorts, udpPorts, tcpDialer, udpDialer)
-			})
-		}
-
-		session.Close()
-		relayConn.Close()
-		log.Printf("VPN: session closed, will reconnect in 5 seconds")
-		time.Sleep(5 * time.Second)
-	}
-}
-
-func handleVPNStream(stream *smux.Stream, tcpPorts, udpPorts []uint16, tcpDialer, udpDialer *net.Dialer) {
-	defer stream.Close()
-
-	headerData := make([]byte, protocolHeaderSize)
-	if _, err := io.ReadFull(stream, headerData); err != nil {
-		log.Printf("VPN: failed to read protocol header: %v", err)
-		return
-	}
-
-	header, err := DecodeProtocolHeader(headerData)
-	if err != nil {
-		log.Printf("VPN: failed to decode protocol header: %v", err)
-		return
-	}
-	defer protocolHeaderPool.Put(header)
-
-	if header.Protocol == protocolTCP && containsPort(tcpPorts, header.Port) {
-		var localConn net.Conn
-		var err error
-		
-		targetAddr := fmt.Sprintf("127.0.0.1:%d", header.Port)
-		
-		if tcpDialer != nil {
-			localConn, err = tcpDialer.Dial("tcp", targetAddr)
-		} else {
-			localConn, err = net.Dial("tcp", targetAddr)
-		}
-		
-		if err != nil {
-			log.Printf("VPN: failed to connect to local TCP port %d: %v", header.Port, err)
-			return
-		}
-		defer localConn.Close()
-
-		if err := configureTCPConnection(localConn); err != nil {
-			log.Printf("VPN: failed to configure local connection: %v", err)
-			return
-		}
-
-		proxyPairOptimized(localConn, stream)
-
-	} else if header.Protocol == protocolUDP && containsPort(udpPorts, header.Port) {
-		targetAddr := fmt.Sprintf("127.0.0.1:%d", header.Port)
-		udpAddr, err := net.ResolveUDPAddr("udp", targetAddr)
-		if err != nil {
-			log.Printf("VPN: failed to resolve UDP address for port %d: %v", header.Port, err)
-			return
-		}
-
-		var udpConn net.Conn
-		
-		if udpDialer != nil {
-			udpConn, err = udpDialer.Dial("udp", udpAddr.String())
-		} else {
-			udpConn, err = net.DialUDP("udp", nil, udpAddr)
-		}
-		
-		if err != nil {
-			log.Printf("VPN: failed to connect to local UDP port %d: %v", header.Port, err)
-			return
-		}
-		defer udpConn.Close()
-
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
-
-		done := make(chan struct{}, 2)
-
-		go func() {
-			defer func() { done <- struct{}{} }()
-			buffer := udpBufferPool.Get().([]byte)
-			defer udpBufferPool.Put(buffer)
-			
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				default:
-				}
-				
-				stream.SetReadDeadline(time.Now().Add(udpSessionTimeout))
-				
-				n, err := stream.Read(buffer)
-				if err != nil {
-					if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-						continue
-					}
-					return
-				}
-				
-				udpConn.SetWriteDeadline(time.Now().Add(udpOperationTimeout))
-				_, err = udpConn.Write(buffer[:n])
-				if err != nil {
-					return
-				}
-			}
-		}()
-
-		go func() {
-			defer func() { done <- struct{}{} }()
-			buffer := udpBufferPool.Get().([]byte)
-			defer udpBufferPool.Put(buffer)
-			
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				default:
-				}
-				
-				udpConn.SetReadDeadline(time.Now().Add(udpSessionTimeout))
-				
-				n, err := udpConn.Read(buffer)
-				if err != nil {
-					if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-						continue
-					}
-					return
-				}
-				
-				stream.SetWriteDeadline(time.Now().Add(udpOperationTimeout))
-				_, err = stream.Write(buffer[:n])
-				if err != nil {
-					return
-				}
-			}
-		}()
-
-		<-done
-		cancel()
-
-	} else {
-		log.Printf("VPN: unauthorized protocol/port: %d/%d", header.Protocol, header.Port)
-	}
-}
-
-func containsPort(slice []uint16, item uint16) bool {
-	for _, s := range slice {
-		if s == item {
-			return true
-		}
-	}
-	return false
+        if protocol == "TCP" && contains(v.tcpPorts, targetPort) {
+                v.handleTCPStream(stream, targetPort)
+        } else if protocol == "UDP" && contains(v.udpPorts, targetPort) {
+                v.handleUDPStream(stream, targetPort)
+        } else {
+                log.Printf("VPN: unauthorized protocol/port: %s", protoLine)
+        }
 }
 
 func contains(slice []string, item string) bool {
-	for _, s := range slice {
-		if s == item {
-			return true
-		}
-	}
-	return false
+        for _, s := range slice {
+                if s == item {
+                        return true
+                }
+        }
+        return false
 }
 
-func proxyPairOptimizedWithTrackingAndContext(ctx context.Context, a net.Conn, b net.Conn, connID string) {
-	defer a.Close()
-	defer b.Close()
+func (v *VPNClient) handleTCPStream(stream *smux.Stream, port string) {
+        // Connect to local service
+        var localConn net.Conn
+        var err error
+        
+        // Use custom dialer if available (nonat mode), otherwise use default
+        if v.tcpDialer != nil {
+                localConn, err = v.tcpDialer.Dial("tcp", "127.0.0.1:"+port)
+        } else {
+                localConn, err = net.DialTimeout("tcp", "127.0.0.1:"+port, 5*time.Second)
+        }
+        
+        if err != nil {
+                log.Printf("VPN: failed to connect to local TCP port %s: %v", port, err)
+                return
+        }
+        defer localConn.Close()
 
-	done := make(chan struct{}, 2)
-	limiter := globalConnTracker.GetLimiter(connID)
+        // Tune local TCP connection
+        tuneTCPConn(localConn)
 
-	// Get buffers from pool
-	bufferA := tcpBufferPool.Get().([]byte)
-	bufferB := tcpBufferPool.Get().([]byte)
-	defer tcpBufferPool.Put(bufferA)
-	defer tcpBufferPool.Put(bufferB)
+        // Apply rate limiting to each connection
+        limitedLocalConn := io.ReadWriter(localConn)
+        limitedStream := io.ReadWriter(stream)
 
-	// Cache timeout value
-	idleTimeout := tcpIdleTimeout
-	writeTimeout := 30 * time.Second
+        if v.config.limitBytesPerSec > 0 {
+                // Limit both directions independently
+                limitedLocalReader := NewRateLimitedReader(localConn, v.config.limitBytesPerSec)
+                limitedLocalWriter := NewRateLimitedWriter(localConn, v.config.limitBytesPerSec)
+                limitedStreamReader := NewRateLimitedReader(stream, v.config.limitBytesPerSec)
+                limitedStreamWriter := NewRateLimitedWriter(stream, v.config.limitBytesPerSec)
 
-	go func() {
-		defer func() { done <- struct{}{} }()
-		
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			default:
-			}
-			
-			a.SetReadDeadline(time.Now().Add(idleTimeout))
-			
-			n, err := a.Read(bufferA)
-			if err != nil {
-				return
-			}
-			
-			if limiter != nil {
-				limiter.uploadLimiter.WaitForTokens(int64(n))
-			}
-			
-			globalConnTracker.Update(connID)
-			
-			b.SetWriteDeadline(time.Now().Add(writeTimeout))
-			
-			_, err = b.Write(bufferA[:n])
-			if err != nil {
-				return
-			}
-		}
-	}()
+                limitedLocalConn = struct {
+                        io.Reader
+                        io.Writer
+                }{limitedLocalReader, limitedLocalWriter}
 
-	go func() {
-		defer func() { done <- struct{}{} }()
-		
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			default:
-			}
-			
-			b.SetReadDeadline(time.Now().Add(idleTimeout))
-			
-			n, err := b.Read(bufferB)
-			if err != nil {
-				return
-			}
-			
-			if limiter != nil {
-				limiter.downloadLimiter.WaitForTokens(int64(n))
-			}
-			
-			globalConnTracker.Update(connID)
-			
-			a.SetWriteDeadline(time.Now().Add(writeTimeout))
-			
-			_, err = a.Write(bufferB[:n])
-			if err != nil {
-				return
-			}
-		}
-	}()
+                limitedStream = struct {
+                        io.Reader
+                        io.Writer
+                }{limitedStreamReader, limitedStreamWriter}
+        }
 
-	select {
-	case <-done:
-	case <-ctx.Done():
-	}
+        // Bidirectional copy with buffer pooling
+        done := make(chan error, 2)
+
+        go func() {
+                bufPtr := bufferPool.Get().(*[]byte)
+                defer bufferPool.Put(bufPtr)
+                _, err := io.CopyBuffer(limitedLocalConn, limitedStream, *bufPtr)
+                localConn.Close() // Close write side to signal EOF
+                done <- err
+        }()
+
+        go func() {
+                bufPtr := bufferPool.Get().(*[]byte)
+                defer bufferPool.Put(bufPtr)
+                _, err := io.CopyBuffer(limitedStream, limitedLocalConn, *bufPtr)
+                stream.Close() // Close write side to signal EOF
+                done <- err
+        }()
+
+        // Wait for both directions
+        <-done
+        <-done
 }
 
-func proxyPairOptimizedWithTracking(a net.Conn, b net.Conn, connID string) {
-	ctx := context.Background()
-	proxyPairOptimizedWithTrackingAndContext(ctx, a, b, connID)
+func (v *VPNClient) handleUDPStream(stream *smux.Stream, port string) {
+        // Connect to local UDP service
+        localAddr, err := net.ResolveUDPAddr("udp", "127.0.0.1:"+port)
+        if err != nil {
+                log.Printf("VPN: failed to resolve UDP address for port %s: %v", port, err)
+                return
+        }
+
+        var localConn net.Conn
+        
+        // Use custom dialer if available (nonat mode), otherwise use default
+        if v.udpDialer != nil {
+                localConn, err = v.udpDialer.Dial("udp", localAddr.String())
+        } else {
+                localConn, err = net.DialUDP("udp", nil, localAddr)
+        }
+        
+        if err != nil {
+                log.Printf("VPN: failed to connect to local UDP port %s: %v", port, err)
+                return
+        }
+        defer localConn.Close()
+
+        // Set large UDP buffers if it's a UDPConn
+        if udpConn, ok := localConn.(*net.UDPConn); ok {
+                udpConn.SetReadBuffer(tcpReadBuffer)
+                udpConn.SetWriteBuffer(tcpWriteBuffer)
+        }
+
+        // Create rate limiters for UDP
+        var readLimiter, writeLimiter *rate.Limiter
+        if v.config.limitBytesPerSec > 0 {
+                burst := int(v.config.limitBytesPerSec * 2)
+                if burst < 1024*1024 {
+                        burst = 1024 * 1024
+                }
+                readLimiter = rate.NewLimiter(rate.Limit(v.config.limitBytesPerSec), burst)
+                writeLimiter = rate.NewLimiter(rate.Limit(v.config.limitBytesPerSec), burst)
+        }
+
+        done := make(chan struct{})
+
+        // Read from stream and forward to local UDP
+        go func() {
+                defer close(done)
+                lenBuf := make([]byte, 2)
+
+                for {
+                        if _, err := io.ReadFull(stream, lenBuf); err != nil {
+                                return
+                        }
+
+                        length := binary.BigEndian.Uint16(lenBuf)
+                        if length == 0 || length > udpBufferSize {
+                                return
+                        }
+
+                        // Use buffer pool
+                        bufPtr := udpBufferPool.Get().(*[]byte)
+                        data := (*bufPtr)[:length]
+
+                        if _, err := io.ReadFull(stream, data); err != nil {
+                                udpBufferPool.Put(bufPtr)
+                                return
+                        }
+
+                        // Apply rate limiting
+                        if readLimiter != nil {
+                                readLimiter.WaitN(context.Background(), len(data))
+                        }
+
+                        localConn.Write(data)
+                        udpBufferPool.Put(bufPtr)
+                }
+        }()
+
+        // Read from local UDP and forward to stream
+        go func() {
+                bufPtr := udpBufferPool.Get().(*[]byte)
+                defer udpBufferPool.Put(bufPtr)
+                buf := *bufPtr
+
+                for {
+                        localConn.SetReadDeadline(time.Now().Add(1 * time.Second))
+                        n, err := localConn.Read(buf)
+                        if err != nil {
+                                if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+                                        select {
+                                        case <-done:
+                                                return
+                                        default:
+                                                continue
+                                        }
+                                }
+                                return
+                        }
+
+                        // Apply rate limiting
+                        if writeLimiter != nil {
+                                writeLimiter.WaitN(context.Background(), n+2)
+                        }
+
+                        // Write length prefix
+                        lenBuf := make([]byte, 2)
+                        binary.BigEndian.PutUint16(lenBuf, uint16(n))
+                        if _, err := stream.Write(lenBuf); err != nil {
+                                return
+                        }
+                        if _, err := stream.Write(buf[:n]); err != nil {
+                                return
+                        }
+                }
+        }()
+
+        <-done
 }
 
-func proxyPairOptimized(a net.Conn, b net.Conn) {
-	defer a.Close()
-	defer b.Close()
+func main() {
+        config := &Config{}
 
-	done := make(chan struct{}, 2)
+        flag.StringVar(&config.Mode, "mode", "", "Mode: relay or vpn")
+        flag.StringVar(&config.Host, "host", "", "Relay server host:port (vpn mode)")
+        flag.StringVar(&config.Port, "port", "", "Port to listen on (relay mode)")
+        flag.StringVar(&config.Token, "token", "", "Authentication token")
+        flag.StringVar(&config.Forward, "forward", "", "Local TCP ports to forward, comma-separated (vpn mode)")
+        flag.StringVar(&config.ForwardUDP, "forwardudp", "", "Local UDP ports to forward, comma-separated (vpn mode)")
+        flag.StringVar(&config.Limit, "limit", "", "Bandwidth limit per connection (e.g., 16m for 16 Mbps)")
+        flag.BoolVar(&config.NoNAT, "nonat", false, "Use server's public IP as source for local connections (vpn mode only)")
+        flag.Parse()
 
-	bufferA := tcpBufferPool.Get().([]byte)
-	bufferB := tcpBufferPool.Get().([]byte)
-	defer tcpBufferPool.Put(bufferA)
-	defer tcpBufferPool.Put(bufferB)
+        if config.Token == "" {
+                log.Fatal("Token is required (-token)")
+        }
 
-	go func() {
-		io.CopyBuffer(b, a, bufferA)
-		done <- struct{}{}
-	}()
+        // Parse bandwidth limit
+        if config.Limit != "" {
+                bytesPerSec, err := parseBandwidthLimit(config.Limit)
+                if err != nil {
+                        log.Fatalf("Invalid bandwidth limit: %v", err)
+                }
+                config.limitBytesPerSec = bytesPerSec
 
-	go func() {
-		io.CopyBuffer(a, b, bufferB)
-		done <- struct{}{}
-	}()
+                // Convert to human-readable format (using 1024 multiplier)
+                mbps := float64(bytesPerSec) * 8 / (1024 * 1024)
+                log.Printf("Bandwidth limit: %.2f Mbps (%d bytes/sec) per connection", mbps, bytesPerSec)
+        }
 
-	<-done
-}
+        switch config.Mode {
+        case "relay":
+                if config.Port == "" {
+                        log.Fatal("Relay mode requires -port")
+                }
+                server := NewRelayServer(config)
+                if err := server.Start(); err != nil {
+                        log.Fatalf("Relay server error: %v", err)
+                }
 
-func constantTimeEqual(a, b string) bool {
-	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
+        case "vpn":
+                if config.Host == "" {
+                        log.Fatal("VPN mode requires -host")
+                }
+                if config.Forward == "" && config.ForwardUDP == "" {
+                        log.Fatal("VPN mode requires -forward and/or -forwardudp")
+                }
+                client, err := NewVPNClient(config)
+                if err != nil {
+                        log.Fatalf("VPN client setup error: %v", err)
+                }
+                if err := client.Start(); err != nil {
+                        log.Fatalf("VPN client error: %v", err)
+                }
+
+        default:
+                log.Fatal("Invalid mode. Use -mode relay or -mode vpn")
+        }
 }
