@@ -3,11 +3,18 @@ package main
 import (
         "bufio"
         "context"
+        "crypto/rand"
+        "crypto/rsa"
+        "crypto/tls"
+        "crypto/x509"
+        "crypto/x509/pkix"
         "encoding/binary"
+        "encoding/pem"
         "flag"
         "fmt"
         "io"
         "log"
+        "math/big"
         "net"
         "strconv"
         "strings"
@@ -95,6 +102,7 @@ type Config struct {
         ForwardUDP string
         Limit      string // e.g., "16m" for 16 Mbps
         NoNAT      bool
+        TLS        bool
         limitBytesPerSec int64
 }
 
@@ -264,6 +272,58 @@ func setupDialers() (net.IP, *net.Dialer, *net.Dialer, error) {
         return publicIP, tcpDialer, udpDialer, nil
 }
 
+// createTLSConfig creates a TLS configuration for the relay server
+// Generates a self-signed certificate on-the-fly
+func createTLSConfig() (*tls.Config, error) {
+        cert, err := generateSelfSignedCert()
+        if err != nil {
+                return nil, fmt.Errorf("failed to generate certificate: %v", err)
+        }
+
+        return &tls.Config{
+                Certificates: []tls.Certificate{cert},
+                MinVersion:   tls.VersionTLS12,
+        }, nil
+}
+
+// generateSelfSignedCert creates a self-signed certificate valid for 10 years
+func generateSelfSignedCert() (tls.Certificate, error) {
+        priv, err := rsa.GenerateKey(rand.Reader, 2048)
+        if err != nil {
+                return tls.Certificate{}, err
+        }
+
+        notBefore := time.Now()
+        notAfter := notBefore.Add(10 * 365 * 24 * time.Hour)
+
+        serialNumber, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+        if err != nil {
+                return tls.Certificate{}, err
+        }
+
+        template := x509.Certificate{
+                SerialNumber: serialNumber,
+                Subject: pkix.Name{
+                        Organization: []string{"Tunnel"},
+                },
+                NotBefore:             notBefore,
+                NotAfter:              notAfter,
+                KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+                ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+                BasicConstraintsValid: true,
+        }
+
+        derBytes, err := x509.CreateCertificate(rand.Reader, &template, &template, &priv.PublicKey, priv)
+        if err != nil {
+                return tls.Certificate{}, err
+        }
+
+        certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: derBytes})
+        keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(priv)})
+
+        return tls.X509KeyPair(certPEM, keyPEM)
+}
+
 // RelayServer handles incoming tunnel connections
 type RelayServer struct {
         config    *Config
@@ -318,9 +378,24 @@ func NewRelayServer(config *Config) *RelayServer {
 }
 
 func (r *RelayServer) Start() error {
-        listener, err := net.Listen("tcp", ":"+r.config.Port)
-        if err != nil {
-                return fmt.Errorf("failed to listen: %v", err)
+        var listener net.Listener
+        var err error
+
+        if r.config.TLS {
+                tlsConfig, err := createTLSConfig()
+                if err != nil {
+                        return fmt.Errorf("failed to create TLS config: %v", err)
+                }
+                listener, err = tls.Listen("tcp", ":"+r.config.Port, tlsConfig)
+                if err != nil {
+                        return fmt.Errorf("failed to start TLS listener: %v", err)
+                }
+                log.Printf("Relay: TLS enabled")
+        } else {
+                listener, err = net.Listen("tcp", ":"+r.config.Port)
+                if err != nil {
+                        return fmt.Errorf("failed to listen: %v", err)
+                }
         }
         defer listener.Close()
 
@@ -895,9 +970,23 @@ func (v *VPNClient) Start() error {
 }
 
 func (v *VPNClient) connect() error {
-        conn, err := net.Dial("tcp", v.config.Host)
-        if err != nil {
-                return fmt.Errorf("dial failed: %v", err)
+        var conn net.Conn
+        var err error
+
+        if v.config.TLS {
+                tlsConfig := &tls.Config{
+                        InsecureSkipVerify: true, // Don't verify hostname
+                }
+                conn, err = tls.Dial("tcp", v.config.Host, tlsConfig)
+                if err != nil {
+                        return fmt.Errorf("TLS dial failed: %v", err)
+                }
+                log.Printf("VPN: TLS connection established (no hostname verification)")
+        } else {
+                conn, err = net.Dial("tcp", v.config.Host)
+                if err != nil {
+                        return fmt.Errorf("dial failed: %v", err)
+                }
         }
         defer conn.Close()
 
@@ -1205,6 +1294,7 @@ func main() {
         flag.StringVar(&config.ForwardUDP, "forwardudp", "", "Local UDP ports to forward, comma-separated (vpn mode)")
         flag.StringVar(&config.Limit, "limit", "", "Bandwidth limit per connection (e.g., 16m for 16 Mbps)")
         flag.BoolVar(&config.NoNAT, "nonat", false, "Use server's public IP as source for local connections (vpn mode only)")
+        flag.BoolVar(&config.TLS, "tls", false, "Enable TLS encryption (no hostname verification)")
         flag.Parse()
 
         if config.Token == "" {
