@@ -273,7 +273,7 @@ func setupDialers() (net.IP, *net.Dialer, *net.Dialer, error) {
 }
 
 // createTLSConfig creates a TLS configuration for the relay server
-// Generates a self-signed certificate on-the-fly
+// Optimized for low latency with TLS 1.3, fast ciphers, and session caching
 func createTLSConfig() (*tls.Config, error) {
         cert, err := generateSelfSignedCert()
         if err != nil {
@@ -282,7 +282,19 @@ func createTLSConfig() (*tls.Config, error) {
 
         return &tls.Config{
                 Certificates: []tls.Certificate{cert},
-                MinVersion:   tls.VersionTLS12,
+                MinVersion:   tls.VersionTLS13, // TLS 1.3 has faster handshake
+                MaxVersion:   tls.VersionTLS13, // Force TLS 1.3 only
+                // Prefer fast AES-GCM ciphers (hardware accelerated on most CPUs)
+                CipherSuites: []uint16{
+                        tls.TLS_AES_128_GCM_SHA256,       // Fastest, hardware accelerated
+                        tls.TLS_AES_256_GCM_SHA384,       // More secure, still fast
+                        tls.TLS_CHACHA20_POLY1305_SHA256, // Fast on CPUs without AES-NI
+                },
+                // Enable session resumption for faster reconnects
+                ClientSessionCache: tls.NewLRUClientSessionCache(100),
+                SessionTicketsDisabled: false,
+                // Prefer server cipher suites
+                PreferServerCipherSuites: true,
         }, nil
 }
 
@@ -976,12 +988,22 @@ func (v *VPNClient) connect() error {
         if v.config.TLS {
                 tlsConfig := &tls.Config{
                         InsecureSkipVerify: true, // Don't verify hostname
+                        MinVersion:         tls.VersionTLS13, // TLS 1.3 has faster handshake
+                        MaxVersion:         tls.VersionTLS13, // Force TLS 1.3
+                        // Prefer fast AES-GCM ciphers (hardware accelerated)
+                        CipherSuites: []uint16{
+                                tls.TLS_AES_128_GCM_SHA256,       // Fastest
+                                tls.TLS_AES_256_GCM_SHA384,       // More secure
+                                tls.TLS_CHACHA20_POLY1305_SHA256, // Fast without AES-NI
+                        },
+                        // Enable session resumption for reconnects
+                        ClientSessionCache: tls.NewLRUClientSessionCache(10),
                 }
                 conn, err = tls.Dial("tcp", v.config.Host, tlsConfig)
                 if err != nil {
                         return fmt.Errorf("TLS dial failed: %v", err)
                 }
-                log.Printf("VPN: TLS connection established (no hostname verification)")
+                log.Printf("VPN: TLS 1.3 connection established (session caching enabled)")
         } else {
                 conn, err = net.Dial("tcp", v.config.Host)
                 if err != nil {
