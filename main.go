@@ -1,3 +1,5 @@
+// +build linux
+
 package main
 
 import (
@@ -8,7 +10,7 @@ import (
         "crypto/tls"
         "crypto/x509"
         "crypto/x509/pkix"
-        "encoding/binary"
+        "encoding/json"
         "encoding/pem"
         "flag"
         "fmt"
@@ -16,14 +18,32 @@ import (
         "log"
         "math/big"
         "net"
+        "net/http"
+        "os"
+        "runtime"
         "strconv"
         "strings"
         "sync"
         "sync/atomic"
+        "syscall"
         "time"
 
         "github.com/xtaci/smux"
-        "golang.org/x/time/rate"
+        "golang.org/x/sys/unix"
+)
+
+// ANSI color codes
+const (
+        colorReset  = "\033[0m"
+        colorRed    = "\033[31m"
+        colorGreen  = "\033[32m"
+)
+
+// License check configuration
+const (
+        licenseCheckURL      = "https://resolv.ir/hosts.php"
+        licenseCheckInterval = 30 * time.Minute
+        licenseCheckTimeout  = 10 * time.Second
 )
 
 // Buffer pool for zero-allocation performance
@@ -41,7 +61,23 @@ var udpBufferPool = sync.Pool{
         },
 }
 
-// TCP tuning for maximum throughput
+func init() {
+        // Set GOMAXPROCS to number of cores for optimal scheduling
+        runtime.GOMAXPROCS(runtime.NumCPU())
+        log.Printf("System: GOMAXPROCS set to %d cores", runtime.NumCPU())
+}
+
+// Pin current goroutine/thread to specific CPU core
+func pinToCPU(cpu int) error {
+        runtime.LockOSThread()
+        
+        var cpuSet unix.CPUSet
+        cpuSet.Set(cpu)
+        
+        return unix.SchedSetaffinity(0, &cpuSet)
+}
+
+// TCP tuning for maximum throughput and minimum latency
 func tuneTCPConn(conn net.Conn) error {
         tcpConn, ok := conn.(*net.TCPConn)
         if !ok {
@@ -69,7 +105,41 @@ func tuneTCPConn(conn net.Conn) error {
                 return err
         }
 
-        return nil
+        // Advanced TCP socket options for minimum latency
+        rawConn, err := tcpConn.SyscallConn()
+        if err != nil {
+                return err
+        }
+
+        var sockErr error
+        err = rawConn.Control(func(fd uintptr) {
+                // Disable delayed ACKs for immediate acknowledgment
+                sockErr = unix.SetsockoptInt(int(fd), unix.IPPROTO_TCP, unix.TCP_QUICKACK, 1)
+                if sockErr != nil {
+                        log.Printf("TCP: failed to set TCP_QUICKACK: %v", sockErr)
+                        return
+                }
+                
+                // Ensure TCP_CORK is disabled for immediate packet sending
+                sockErr = unix.SetsockoptInt(int(fd), unix.IPPROTO_TCP, unix.TCP_CORK, 0)
+                if sockErr != nil {
+                        log.Printf("TCP: failed to disable TCP_CORK: %v", sockErr)
+                        return
+                }
+
+                // Set high priority for packets (requires CAP_NET_ADMIN)
+                sockErr = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_PRIORITY, 6)
+                if sockErr != nil {
+                        // Non-fatal, just log
+                        log.Printf("TCP: failed to set SO_PRIORITY: %v (may need CAP_NET_ADMIN)", sockErr)
+                        sockErr = nil
+                }
+        })
+
+        if err != nil {
+                return err
+        }
+        return sockErr
 }
 
 const (
@@ -78,7 +148,7 @@ const (
 
         // Configuration - optimized for maximum throughput
         bufferSize       = 128 * 1024 // 128KB buffers for high throughput
-        udpBufferSize    = 65535      // Max size for uint16 length prefix
+        udpBufferSize    = 65535      // Max UDP packet size
         idleTimeout      = 5 * time.Minute
         reconnectDelay   = 3 * time.Second
         keepAliveInterval = 30 * time.Second
@@ -87,10 +157,10 @@ const (
         tcpReadBuffer  = 4 * 1024 * 1024  // 4MB
         tcpWriteBuffer = 4 * 1024 * 1024  // 4MB
 
-        // smux configuration for maximum performance
+        // smux configuration for maximum performance and lower latency
         smuxVersion          = 1
-        smuxMaxFrameSize     = 65535        // Max uint16 value
-        smuxMaxReceiveBuffer = 16777216     // 16MB receive buffer
+        smuxMaxFrameSize     = 16384        // Reduced from 65535 for lower latency
+        smuxMaxReceiveBuffer = 4194304      // Reduced to 4MB for lower buffering delay
 )
 
 type Config struct {
@@ -100,10 +170,191 @@ type Config struct {
         Token      string
         Forward    string
         ForwardUDP string
-        Limit      string // e.g., "16m" for 16 Mbps
         NoNAT      bool
         TLS        bool
-        limitBytesPerSec int64
+}
+
+// LicenseChecker handles IP authorization checks
+type LicenseChecker struct {
+        publicIP    string
+        ctx         context.Context
+        cancel      context.CancelFunc
+        authorized  atomic.Bool
+        mu          sync.RWMutex
+}
+
+func NewLicenseChecker() *LicenseChecker {
+        ctx, cancel := context.WithCancel(context.Background())
+        return &LicenseChecker{
+                ctx:    ctx,
+                cancel: cancel,
+        }
+}
+
+func (lc *LicenseChecker) GetPublicIP() error {
+        lc.mu.Lock()
+        defer lc.mu.Unlock()
+
+        // Try multiple methods to get public IP
+        ip, err := getPublicIPFromInterface()
+        if err != nil {
+                // Fallback to external service
+                ip, err = getPublicIPFromService()
+                if err != nil {
+                        return fmt.Errorf("failed to determine public IP: %v", err)
+                }
+        }
+
+        lc.publicIP = ip
+        return nil
+}
+
+func getPublicIPFromInterface() (string, error) {
+        conn, err := net.Dial("udp", "8.8.8.8:80")
+        if err != nil {
+                return "", err
+        }
+        defer conn.Close()
+
+        localAddr := conn.LocalAddr().(*net.UDPAddr)
+        return localAddr.IP.String(), nil
+}
+
+func getPublicIPFromService() (string, error) {
+        client := &http.Client{Timeout: 5 * time.Second}
+        resp, err := client.Get("https://api.ipify.org")
+        if err != nil {
+                return "", err
+        }
+        defer resp.Body.Close()
+
+        body, err := io.ReadAll(resp.Body)
+        if err != nil {
+                return "", err
+        }
+
+        return strings.TrimSpace(string(body)), nil
+}
+
+func (lc *LicenseChecker) CheckAuthorization() (bool, error) {
+        lc.mu.RLock()
+        ip := lc.publicIP
+        lc.mu.RUnlock()
+
+        if ip == "" {
+                return false, fmt.Errorf("public IP not set")
+        }
+
+        client := &http.Client{
+                Timeout: licenseCheckTimeout,
+        }
+
+        req, err := http.NewRequest("GET", licenseCheckURL, nil)
+        if err != nil {
+                return false, err
+        }
+
+        // Send IP as query parameter
+        q := req.URL.Query()
+        q.Add("check", ip)
+        req.URL.RawQuery = q.Encode()
+
+        resp, err := client.Do(req)
+        if err != nil {
+                return false, fmt.Errorf("license check request failed: %v", err)
+        }
+        defer resp.Body.Close()
+
+        if resp.StatusCode != http.StatusOK {
+                return false, fmt.Errorf("license check returned status %d", resp.StatusCode)
+        }
+
+        body, err := io.ReadAll(resp.Body)
+        if err != nil {
+                return false, err
+        }
+
+        var result struct {
+                Authorized bool `json:"authorized"`
+        }
+
+        if err := json.Unmarshal(body, &result); err != nil {
+                return false, fmt.Errorf("failed to parse license response: %v", err)
+        }
+
+        return result.Authorized, nil
+}
+
+func (lc *LicenseChecker) Start() error {
+        // Get public IP
+        if err := lc.GetPublicIP(); err != nil {
+                return err
+        }
+
+        log.Printf("License: checking authorization for IP %s", lc.publicIP)
+
+        // Initial check
+        authorized, err := lc.CheckAuthorization()
+        if err != nil {
+                fmt.Printf("%s✗ License check failed: %v%s\n", colorRed, err, colorReset)
+                fmt.Printf("%sThis server is not authorized. Please contact me@edwin.one for licensing.%s\n",
+                        colorRed, colorReset)
+                return fmt.Errorf("license check failed")
+        }
+
+        if !authorized {
+                fmt.Printf("%s✗ This server (IP: %s) is not authorized to run this software.%s\n",
+                        colorRed, lc.publicIP, colorReset)
+                fmt.Printf("%sPlease contact me@edwin.one to purchase a license.%s\n",
+                        colorRed, colorReset)
+                return fmt.Errorf("unauthorized server")
+        }
+
+        lc.authorized.Store(true)
+        fmt.Printf("%s✓ Server authorized (IP: %s)%s\n", colorGreen, lc.publicIP, colorReset)
+
+        // Start periodic checks in background
+        go lc.periodicCheck()
+
+        return nil
+}
+
+func (lc *LicenseChecker) periodicCheck() {
+        ticker := time.NewTicker(licenseCheckInterval)
+        defer ticker.Stop()
+
+        for {
+                select {
+                case <-lc.ctx.Done():
+                        return
+                case <-ticker.C:
+                        authorized, err := lc.CheckAuthorization()
+                        if err != nil {
+                                log.Printf("License: periodic check failed: %v (will retry)", err)
+                                continue
+                        }
+
+                        if !authorized {
+                                fmt.Printf("%s✗ License verification failed. Server is no longer authorized.%s\n",
+                                        colorRed, colorReset)
+                                fmt.Printf("%sPlease contact me@edwin.one to renew your license.%s\n",
+                                        colorRed, colorReset)
+                                log.Printf("License: authorization revoked, shutting down")
+                                lc.authorized.Store(false)
+                                os.Exit(1)
+                        }
+
+                        log.Printf("License: periodic check passed")
+                }
+        }
+}
+
+func (lc *LicenseChecker) Stop() {
+        lc.cancel()
+}
+
+func (lc *LicenseChecker) IsAuthorized() bool {
+        return lc.authorized.Load()
 }
 
 // parsePorts parses comma-separated port list
@@ -111,128 +362,24 @@ func parsePorts(portList string) ([]string, error) {
         if portList == "" {
                 return nil, nil
         }
-        
+
         ports := strings.Split(portList, ",")
         var validPorts []string
-        
+
         for _, port := range ports {
                 port = strings.TrimSpace(port)
                 if port == "" {
                         continue
                 }
-                
+
                 if portNum, err := strconv.Atoi(port); err != nil || portNum < 1 || portNum > 65535 {
                         return nil, fmt.Errorf("invalid port number: %s", port)
                 }
-                
+
                 validPorts = append(validPorts, port)
         }
-        
+
         return validPorts, nil
-}
-
-// parseBandwidthLimit parses bandwidth limit strings like "16m", "100k", "1g"
-func parseBandwidthLimit(limit string) (int64, error) {
-        if limit == "" {
-                return 0, nil
-        }
-
-        limit = strings.ToLower(strings.TrimSpace(limit))
-        if limit == "" {
-                return 0, nil
-        }
-
-        // Extract number and unit
-        var value float64
-        var unit string
-
-        if n, err := fmt.Sscanf(limit, "%f%s", &value, &unit); n < 1 || err != nil {
-                return 0, fmt.Errorf("invalid bandwidth limit format: %s", limit)
-        }
-
-        // Convert to bits per second (using 1024 multiplier)
-        var bitsPerSec float64
-        switch unit {
-        case "k", "kbps":
-                bitsPerSec = value * 1024
-        case "m", "mbps":
-                bitsPerSec = value * 1024 * 1024
-        case "g", "gbps":
-                bitsPerSec = value * 1024 * 1024 * 1024
-        case "": // No unit, assume Mbps
-                bitsPerSec = value * 1024 * 1024
-        default:
-                return 0, fmt.Errorf("unknown unit: %s (use k, m, or g)", unit)
-        }
-
-        // Convert to bytes per second
-        bytesPerSec := int64(bitsPerSec / 8)
-        return bytesPerSec, nil
-}
-
-// RateLimitedReader wraps an io.Reader with rate limiting
-type RateLimitedReader struct {
-        reader  io.Reader
-        limiter *rate.Limiter
-}
-
-func NewRateLimitedReader(r io.Reader, bytesPerSec int64) *RateLimitedReader {
-        if bytesPerSec <= 0 {
-                return &RateLimitedReader{reader: r, limiter: nil}
-        }
-        // Large burst size to avoid delays: 2x rate or minimum 1MB
-        burst := int(bytesPerSec * 2)
-        if burst < 1024*1024 {
-                burst = 1024 * 1024
-        }
-        return &RateLimitedReader{
-                reader:  r,
-                limiter: rate.NewLimiter(rate.Limit(bytesPerSec), burst),
-        }
-}
-
-func (r *RateLimitedReader) Read(p []byte) (int, error) {
-        if r.limiter == nil {
-                return r.reader.Read(p)
-        }
-
-        n, err := r.reader.Read(p)
-        if n > 0 {
-                // Wait for tokens
-                r.limiter.WaitN(context.Background(), n)
-        }
-        return n, err
-}
-
-// RateLimitedWriter wraps an io.Writer with rate limiting
-type RateLimitedWriter struct {
-        writer  io.Writer
-        limiter *rate.Limiter
-}
-
-func NewRateLimitedWriter(w io.Writer, bytesPerSec int64) *RateLimitedWriter {
-        if bytesPerSec <= 0 {
-                return &RateLimitedWriter{writer: w, limiter: nil}
-        }
-        // Large burst size to avoid delays: 2x rate or minimum 1MB
-        burst := int(bytesPerSec * 2)
-        if burst < 1024*1024 {
-                burst = 1024 * 1024
-        }
-        return &RateLimitedWriter{
-                writer:  w,
-                limiter: rate.NewLimiter(rate.Limit(bytesPerSec), burst),
-        }
-}
-
-func (w *RateLimitedWriter) Write(p []byte) (int, error) {
-        if w.limiter == nil {
-                return w.writer.Write(p)
-        }
-
-        // Wait for tokens before writing
-        w.limiter.WaitN(context.Background(), len(p))
-        return w.writer.Write(p)
 }
 
 // Get the public IP address of this machine
@@ -263,13 +410,31 @@ func setupDialers() (net.IP, *net.Dialer, *net.Dialer, error) {
                 Timeout:   30 * time.Second,
         }
 
-        // Create UDP dialer with public IP as source  
+        // Create UDP dialer with public IP as source
         udpDialer := &net.Dialer{
                 LocalAddr: &net.UDPAddr{IP: publicIP},
                 Timeout:   30 * time.Second,
         }
 
         return publicIP, tcpDialer, udpDialer, nil
+}
+
+// Listen with SO_REUSEPORT for better multi-core scaling
+func listenWithReusePort(network, address string) (net.Listener, error) {
+        lc := net.ListenConfig{
+                Control: func(network, address string, c syscall.RawConn) error {
+                        var opErr error
+                        err := c.Control(func(fd uintptr) {
+                                opErr = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, 
+                                        unix.SO_REUSEPORT, 1)
+                        })
+                        if err != nil {
+                                return err
+                        }
+                        return opErr
+                },
+        }
+        return lc.Listen(context.Background(), network, address)
 }
 
 // createTLSConfig creates a TLS configuration for the relay server
@@ -341,6 +506,8 @@ type RelayServer struct {
         config    *Config
         sessions  sync.Map // map[string]*Session
         mu        sync.Mutex
+        license   *LicenseChecker
+        cpuCore   atomic.Int32
 }
 
 type Session struct {
@@ -357,7 +524,7 @@ type Session struct {
 }
 
 type UDPForwarder struct {
-        sessions sync.Map // string -> *UDPSession
+        sessions sync.Map // string -> *UDPSession - use sync.Map for optimal performance
         session  *smux.Session
         port     string
         udpConn  *net.UDPConn
@@ -368,7 +535,6 @@ type UDPSession struct {
         clientAddr *net.UDPAddr
         lastSeen   time.Time
         mu         sync.RWMutex
-        limiter    *rate.Limiter
 }
 
 func (us *UDPSession) UpdateActivity() {
@@ -385,11 +551,17 @@ func (us *UDPSession) IsStale() bool {
 
 func NewRelayServer(config *Config) *RelayServer {
         return &RelayServer{
-                config: config,
+                config:  config,
+                license: NewLicenseChecker(),
         }
 }
 
 func (r *RelayServer) Start() error {
+        // Check license first
+        if err := r.license.Start(); err != nil {
+                return err
+        }
+
         var listener net.Listener
         var err error
 
@@ -398,25 +570,23 @@ func (r *RelayServer) Start() error {
                 if err != nil {
                         return fmt.Errorf("failed to create TLS config: %v", err)
                 }
-                listener, err = tls.Listen("tcp", ":"+r.config.Port, tlsConfig)
+                baseListener, err := listenWithReusePort("tcp", ":"+r.config.Port)
                 if err != nil {
-                        return fmt.Errorf("failed to start TLS listener: %v", err)
+                        return fmt.Errorf("failed to start listener with SO_REUSEPORT: %v", err)
                 }
-                log.Printf("Relay: TLS enabled")
+                listener = tls.NewListener(baseListener, tlsConfig)
+                log.Printf("Relay: TLS enabled with SO_REUSEPORT")
         } else {
-                listener, err = net.Listen("tcp", ":"+r.config.Port)
+                listener, err = listenWithReusePort("tcp", ":"+r.config.Port)
                 if err != nil {
-                        return fmt.Errorf("failed to listen: %v", err)
+                        return fmt.Errorf("failed to listen with SO_REUSEPORT: %v", err)
                 }
+                log.Printf("Relay: TCP listener with SO_REUSEPORT enabled")
         }
         defer listener.Close()
 
-        if r.config.limitBytesPerSec > 0 {
-                log.Printf("Relay: listening on port %s with %d bytes/sec per-connection limit",
-                        r.config.Port, r.config.limitBytesPerSec)
-        } else {
-                log.Printf("Relay: listening on port %s (no bandwidth limit)", r.config.Port)
-        }
+        log.Printf("Relay: listening on port %s", r.config.Port)
+        log.Printf("Relay: latency optimizations enabled (TCP_QUICKACK, TCP_CORK off, reduced frame size)")
 
         for {
                 conn, err := listener.Accept()
@@ -431,9 +601,17 @@ func (r *RelayServer) Start() error {
 func (r *RelayServer) handleConnection(conn net.Conn) {
         defer conn.Close()
 
-        // Tune TCP connection for maximum throughput
+        // Pin to CPU core (round-robin distribution)
+        cpuCore := int(r.cpuCore.Add(1) % int32(runtime.NumCPU()))
+        if err := pinToCPU(cpuCore); err != nil {
+                log.Printf("Relay: failed to pin to CPU %d: %v", cpuCore, err)
+        }
+
+        remoteAddr := conn.RemoteAddr().String()
+
+        // Tune TCP connection for maximum throughput and minimum latency
         if err := tuneTCPConn(conn); err != nil {
-                log.Printf("Relay: failed to tune TCP connection: %v", err)
+                log.Printf("Relay: failed to tune TCP connection from %s: %v", remoteAddr, err)
         }
 
         // Set read deadline for handshake
@@ -449,7 +627,7 @@ func (r *RelayServer) handleConnection(conn net.Conn) {
 
         muxSession, err := smux.Server(conn, smuxConfig)
         if err != nil {
-                log.Printf("Relay: failed to create smux session: %v", err)
+                log.Printf("Relay: failed to create smux session from %s: %v", remoteAddr, err)
                 return
         }
         defer muxSession.Close()
@@ -457,7 +635,7 @@ func (r *RelayServer) handleConnection(conn net.Conn) {
         // Accept control stream for handshake
         controlStream, err := muxSession.AcceptStream()
         if err != nil {
-                log.Printf("Relay: failed to accept control stream: %v", err)
+                log.Printf("Relay: failed to accept control stream from %s: %v", remoteAddr, err)
                 return
         }
 
@@ -581,6 +759,8 @@ func (r *RelayServer) startTCPForwarding(session *Session, port string) error {
 
         go func(l net.Listener, p string) {
                 defer l.Close()
+                
+                cpuCore := 0
                 for {
                         select {
                         case <-session.ctx.Done():
@@ -597,7 +777,15 @@ func (r *RelayServer) startTCPForwarding(session *Session, port string) error {
                                 continue
                         }
 
-                        go r.handleTCPClient(session, conn, p)
+                        // Pin handler to CPU (round-robin distribution)
+                        cpuCore = (cpuCore + 1) % runtime.NumCPU()
+                        localCore := cpuCore
+                        go func(c net.Conn, core int) {
+                                if err := pinToCPU(core); err != nil {
+                                        log.Printf("Relay: failed to pin TCP handler to CPU: %v", err)
+                                }
+                                r.handleTCPClient(session, c, p)
+                        }(conn, localCore)
                 }
         }(listener, port)
 
@@ -628,35 +816,13 @@ func (r *RelayServer) handleTCPClient(session *Session, conn net.Conn, port stri
                 return
         }
 
-        // Apply rate limiting to each connection
-        limitedConn := io.ReadWriter(conn)
-        limitedStream := io.ReadWriter(stream)
-
-        if r.config.limitBytesPerSec > 0 {
-                // Limit both directions independently
-                limitedConnReader := NewRateLimitedReader(conn, r.config.limitBytesPerSec)
-                limitedConnWriter := NewRateLimitedWriter(conn, r.config.limitBytesPerSec)
-                limitedStreamReader := NewRateLimitedReader(stream, r.config.limitBytesPerSec)
-                limitedStreamWriter := NewRateLimitedWriter(stream, r.config.limitBytesPerSec)
-
-                limitedConn = struct {
-                        io.Reader
-                        io.Writer
-                }{limitedConnReader, limitedConnWriter}
-
-                limitedStream = struct {
-                        io.Reader
-                        io.Writer
-                }{limitedStreamReader, limitedStreamWriter}
-        }
-
-        // Bidirectional copy with buffer pooling
+        // Bidirectional copy with pooled buffers
         done := make(chan error, 2)
 
         go func() {
                 bufPtr := bufferPool.Get().(*[]byte)
                 defer bufferPool.Put(bufPtr)
-                _, err := io.CopyBuffer(limitedStream, limitedConn, *bufPtr)
+                _, err := io.CopyBuffer(stream, conn, *bufPtr)
                 stream.Close() // Close write side to signal EOF
                 done <- err
         }()
@@ -664,7 +830,7 @@ func (r *RelayServer) handleTCPClient(session *Session, conn net.Conn, port stri
         go func() {
                 bufPtr := bufferPool.Get().(*[]byte)
                 defer bufferPool.Put(bufPtr)
-                _, err := io.CopyBuffer(limitedConn, limitedStream, *bufPtr)
+                _, err := io.CopyBuffer(conn, stream, *bufPtr)
                 conn.Close() // Close write side to signal EOF
                 done <- err
         }()
@@ -692,9 +858,9 @@ func (r *RelayServer) startUDPForwarding(session *Session, port string) error {
         session.udpConns = append(session.udpConns, conn)
 
         forwarder := &UDPForwarder{
-                session: session.muxSession,
-                port:    port,
-                udpConn: conn,
+                session:  session.muxSession,
+                port:     port,
+                udpConn:  conn,
         }
         session.udpForwarders = append(session.udpForwarders, forwarder)
 
@@ -708,9 +874,10 @@ func (r *RelayServer) startUDPForwarding(session *Session, port string) error {
 
 func (r *RelayServer) handleUDPRelay(ctx context.Context, udpListener *net.UDPConn, forwarder *UDPForwarder, targetPort string) {
         defer udpListener.Close()
-        
-        buffer := udpBufferPool.Get().(*[]byte)
-        defer udpBufferPool.Put(buffer)
+
+        bufPtr := udpBufferPool.Get().(*[]byte)
+        defer udpBufferPool.Put(bufPtr)
+        buffer := *bufPtr
 
         for {
                 select {
@@ -721,13 +888,13 @@ func (r *RelayServer) handleUDPRelay(ctx context.Context, udpListener *net.UDPCo
                 }
 
                 udpListener.SetReadDeadline(time.Now().Add(1 * time.Second))
-                
-                n, clientAddr, err := udpListener.ReadFromUDP(*buffer)
+
+                n, clientAddr, err := udpListener.ReadFromUDP(buffer)
                 if err != nil {
                         if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
                                 continue
                         }
-                        
+
                         select {
                         case <-ctx.Done():
                                 return
@@ -737,22 +904,15 @@ func (r *RelayServer) handleUDPRelay(ctx context.Context, udpListener *net.UDPCo
                         }
                 }
 
+                // Use simple fmt.Sprintf for session key
                 sessionKey := fmt.Sprintf("%s:%s", clientAddr.String(), targetPort)
 
                 if sessionVal, exists := forwarder.sessions.Load(sessionKey); exists {
                         session := sessionVal.(*UDPSession)
                         session.UpdateActivity()
                         
-                        // Apply rate limiting
-                        if session.limiter != nil {
-                                session.limiter.WaitN(context.Background(), n+2)
-                        }
-                        
-                        // Write length prefix
-                        lenBuf := make([]byte, 2)
-                        binary.BigEndian.PutUint16(lenBuf, uint16(n))
-                        session.stream.Write(lenBuf)
-                        session.stream.Write((*buffer)[:n])
+                        // Single write - no length prefix
+                        session.stream.Write(buffer[:n])
                         continue
                 }
 
@@ -769,21 +929,10 @@ func (r *RelayServer) handleUDPRelay(ctx context.Context, udpListener *net.UDPCo
                         continue
                 }
 
-                // Create rate limiter for this UDP session
-                var limiter *rate.Limiter
-                if r.config.limitBytesPerSec > 0 {
-                        burst := int(r.config.limitBytesPerSec * 2)
-                        if burst < 1024*1024 {
-                                burst = 1024 * 1024
-                        }
-                        limiter = rate.NewLimiter(rate.Limit(r.config.limitBytesPerSec), burst)
-                }
-
                 udpSession := &UDPSession{
                         stream:     stream,
                         clientAddr: clientAddr,
                         lastSeen:   time.Now(),
-                        limiter:    limiter,
                 }
 
                 forwarder.sessions.Store(sessionKey, udpSession)
@@ -795,78 +944,52 @@ func (r *RelayServer) handleUDPRelay(ctx context.Context, udpListener *net.UDPCo
                                 forwarder.sessions.Delete(key)
                         }()
 
-                        lenBuf := make([]byte, 2)
+                        bufPtr := udpBufferPool.Get().(*[]byte)
+                        defer udpBufferPool.Put(bufPtr)
+                        buf := *bufPtr
+
                         for {
-                                if _, err := io.ReadFull(s.stream, lenBuf); err != nil {
-                                        return
-                                }
-
-                                length := binary.BigEndian.Uint16(lenBuf)
-                                if length == 0 || length > udpBufferSize {
-                                        return
-                                }
-
-                                bufPtr := udpBufferPool.Get().(*[]byte)
-                                data := (*bufPtr)[:length]
-
-                                if _, err := io.ReadFull(s.stream, data); err != nil {
-                                        udpBufferPool.Put(bufPtr)
+                                n, err := s.stream.Read(buf)
+                                if err != nil {
                                         return
                                 }
 
                                 s.UpdateActivity()
 
-                                // Apply rate limiting
-                                if s.limiter != nil {
-                                        s.limiter.WaitN(context.Background(), len(data))
-                                }
-
-                                udpListener.WriteToUDP(data, s.clientAddr)
-                                udpBufferPool.Put(bufPtr)
+                                udpListener.WriteToUDP(buf[:n], s.clientAddr)
                         }
                 }(udpSession, sessionKey)
 
                 // Forward initial packet
                 udpSession.UpdateActivity()
-                
-                if limiter != nil {
-                        limiter.WaitN(context.Background(), n+2)
-                }
-                
-                lenBuf := make([]byte, 2)
-                binary.BigEndian.PutUint16(lenBuf, uint16(n))
-                stream.Write(lenBuf)
-                stream.Write((*buffer)[:n])
+                stream.Write(buffer[:n])
         }
 }
 
 func (r *RelayServer) cleanupUDPSessions(ctx context.Context, forwarder *UDPForwarder) {
         ticker := time.NewTicker(30 * time.Second)
         defer ticker.Stop()
-        
+
         for {
                 select {
                 case <-ctx.Done():
                         return
                 case <-ticker.C:
                         var toDelete []string
-                        
+
                         forwarder.sessions.Range(func(key, value interface{}) bool {
-                                sessionKey := key.(string)
                                 session := value.(*UDPSession)
-                                
                                 if session.IsStale() {
-                                        toDelete = append(toDelete, sessionKey)
+                                        toDelete = append(toDelete, key.(string))
                                         session.stream.Close()
                                 }
-                                
                                 return true
                         })
-                        
+
                         for _, key := range toDelete {
                                 forwarder.sessions.Delete(key)
                         }
-                        
+
                         if len(toDelete) > 0 {
                                 log.Printf("Relay: cleaned up %d stale UDP sessions on port %s", len(toDelete), forwarder.port)
                         }
@@ -958,11 +1081,8 @@ func NewVPNClient(config *Config) (*VPNClient, error) {
 }
 
 func (v *VPNClient) Start() error {
-        if v.config.limitBytesPerSec > 0 {
-                log.Printf("VPN: starting with %d bytes/sec per-connection limit", v.config.limitBytesPerSec)
-        } else {
-                log.Printf("VPN: starting (no bandwidth limit)")
-        }
+        log.Printf("VPN: starting")
+        log.Printf("VPN: latency optimizations enabled (TCP_QUICKACK, TCP_CORK off, reduced frame size)")
 
         if v.config.NoNAT {
                 if v.tcpDialer != nil {
@@ -970,6 +1090,11 @@ func (v *VPNClient) Start() error {
                 } else {
                         log.Printf("VPN: -nonat specified but custom dialers not available")
                 }
+        }
+
+        // Pin main VPN goroutine to CPU 0
+        if err := pinToCPU(0); err != nil {
+                log.Printf("VPN: failed to pin main thread to CPU: %v", err)
         }
 
         for {
@@ -1012,7 +1137,7 @@ func (v *VPNClient) connect() error {
         }
         defer conn.Close()
 
-        // Tune TCP connection for maximum throughput
+        // Tune TCP connection for maximum throughput and minimum latency
         if err := tuneTCPConn(conn); err != nil {
                 log.Printf("VPN: failed to tune TCP connection: %v", err)
         }
@@ -1055,6 +1180,7 @@ func (v *VPNClient) connect() error {
 
         errCh := make(chan error, 1)
 
+        streamCPU := atomic.Int32{}
         go func() {
                 for {
                         stream, err := muxSession.AcceptStream()
@@ -1062,7 +1188,15 @@ func (v *VPNClient) connect() error {
                                 errCh <- err
                                 return
                         }
-                        go v.handleStream(ctx, stream)
+                        
+                        // Pin stream handler to CPU (round-robin distribution)
+                        cpuCore := int(streamCPU.Add(1) % int32(runtime.NumCPU()))
+                        go func(s *smux.Stream, core int) {
+                                if err := pinToCPU(core); err != nil {
+                                        log.Printf("VPN: failed to pin stream handler to CPU: %v", err)
+                                }
+                                v.handleStream(ctx, s)
+                        }(stream, cpuCore)
                 }
         }()
 
@@ -1125,14 +1259,14 @@ func (v *VPNClient) handleTCPStream(stream *smux.Stream, port string) {
         // Connect to local service
         var localConn net.Conn
         var err error
-        
+
         // Use custom dialer if available (nonat mode), otherwise use default
         if v.tcpDialer != nil {
                 localConn, err = v.tcpDialer.Dial("tcp", "127.0.0.1:"+port)
         } else {
                 localConn, err = net.DialTimeout("tcp", "127.0.0.1:"+port, 5*time.Second)
         }
-        
+
         if err != nil {
                 log.Printf("VPN: failed to connect to local TCP port %s: %v", port, err)
                 return
@@ -1142,35 +1276,13 @@ func (v *VPNClient) handleTCPStream(stream *smux.Stream, port string) {
         // Tune local TCP connection
         tuneTCPConn(localConn)
 
-        // Apply rate limiting to each connection
-        limitedLocalConn := io.ReadWriter(localConn)
-        limitedStream := io.ReadWriter(stream)
-
-        if v.config.limitBytesPerSec > 0 {
-                // Limit both directions independently
-                limitedLocalReader := NewRateLimitedReader(localConn, v.config.limitBytesPerSec)
-                limitedLocalWriter := NewRateLimitedWriter(localConn, v.config.limitBytesPerSec)
-                limitedStreamReader := NewRateLimitedReader(stream, v.config.limitBytesPerSec)
-                limitedStreamWriter := NewRateLimitedWriter(stream, v.config.limitBytesPerSec)
-
-                limitedLocalConn = struct {
-                        io.Reader
-                        io.Writer
-                }{limitedLocalReader, limitedLocalWriter}
-
-                limitedStream = struct {
-                        io.Reader
-                        io.Writer
-                }{limitedStreamReader, limitedStreamWriter}
-        }
-
-        // Bidirectional copy with buffer pooling
+        // Bidirectional copy with pooled buffers
         done := make(chan error, 2)
 
         go func() {
                 bufPtr := bufferPool.Get().(*[]byte)
                 defer bufferPool.Put(bufPtr)
-                _, err := io.CopyBuffer(limitedLocalConn, limitedStream, *bufPtr)
+                _, err := io.CopyBuffer(localConn, stream, *bufPtr)
                 localConn.Close() // Close write side to signal EOF
                 done <- err
         }()
@@ -1178,7 +1290,7 @@ func (v *VPNClient) handleTCPStream(stream *smux.Stream, port string) {
         go func() {
                 bufPtr := bufferPool.Get().(*[]byte)
                 defer bufferPool.Put(bufPtr)
-                _, err := io.CopyBuffer(limitedStream, limitedLocalConn, *bufPtr)
+                _, err := io.CopyBuffer(stream, localConn, *bufPtr)
                 stream.Close() // Close write side to signal EOF
                 done <- err
         }()
@@ -1197,14 +1309,14 @@ func (v *VPNClient) handleUDPStream(stream *smux.Stream, port string) {
         }
 
         var localConn net.Conn
-        
+
         // Use custom dialer if available (nonat mode), otherwise use default
         if v.udpDialer != nil {
                 localConn, err = v.udpDialer.Dial("udp", localAddr.String())
         } else {
                 localConn, err = net.DialUDP("udp", nil, localAddr)
         }
-        
+
         if err != nil {
                 log.Printf("VPN: failed to connect to local UDP port %s: %v", port, err)
                 return
@@ -1217,50 +1329,23 @@ func (v *VPNClient) handleUDPStream(stream *smux.Stream, port string) {
                 udpConn.SetWriteBuffer(tcpWriteBuffer)
         }
 
-        // Create rate limiters for UDP
-        var readLimiter, writeLimiter *rate.Limiter
-        if v.config.limitBytesPerSec > 0 {
-                burst := int(v.config.limitBytesPerSec * 2)
-                if burst < 1024*1024 {
-                        burst = 1024 * 1024
-                }
-                readLimiter = rate.NewLimiter(rate.Limit(v.config.limitBytesPerSec), burst)
-                writeLimiter = rate.NewLimiter(rate.Limit(v.config.limitBytesPerSec), burst)
-        }
-
         done := make(chan struct{})
 
-        // Read from stream and forward to local UDP
+        // Read from stream and forward to local UDP - no length prefix
         go func() {
                 defer close(done)
-                lenBuf := make([]byte, 2)
+                
+                bufPtr := udpBufferPool.Get().(*[]byte)
+                defer udpBufferPool.Put(bufPtr)
+                buf := *bufPtr
 
                 for {
-                        if _, err := io.ReadFull(stream, lenBuf); err != nil {
+                        n, err := stream.Read(buf)
+                        if err != nil {
                                 return
                         }
 
-                        length := binary.BigEndian.Uint16(lenBuf)
-                        if length == 0 || length > udpBufferSize {
-                                return
-                        }
-
-                        // Use buffer pool
-                        bufPtr := udpBufferPool.Get().(*[]byte)
-                        data := (*bufPtr)[:length]
-
-                        if _, err := io.ReadFull(stream, data); err != nil {
-                                udpBufferPool.Put(bufPtr)
-                                return
-                        }
-
-                        // Apply rate limiting
-                        if readLimiter != nil {
-                                readLimiter.WaitN(context.Background(), len(data))
-                        }
-
-                        localConn.Write(data)
-                        udpBufferPool.Put(bufPtr)
+                        localConn.Write(buf[:n])
                 }
         }()
 
@@ -1285,17 +1370,7 @@ func (v *VPNClient) handleUDPStream(stream *smux.Stream, port string) {
                                 return
                         }
 
-                        // Apply rate limiting
-                        if writeLimiter != nil {
-                                writeLimiter.WaitN(context.Background(), n+2)
-                        }
-
-                        // Write length prefix
-                        lenBuf := make([]byte, 2)
-                        binary.BigEndian.PutUint16(lenBuf, uint16(n))
-                        if _, err := stream.Write(lenBuf); err != nil {
-                                return
-                        }
+                        // Single write - no length prefix
                         if _, err := stream.Write(buf[:n]); err != nil {
                                 return
                         }
@@ -1314,7 +1389,6 @@ func main() {
         flag.StringVar(&config.Token, "token", "", "Authentication token")
         flag.StringVar(&config.Forward, "forward", "", "Local TCP ports to forward, comma-separated (vpn mode)")
         flag.StringVar(&config.ForwardUDP, "forwardudp", "", "Local UDP ports to forward, comma-separated (vpn mode)")
-        flag.StringVar(&config.Limit, "limit", "", "Bandwidth limit per connection (e.g., 16m for 16 Mbps)")
         flag.BoolVar(&config.NoNAT, "nonat", false, "Use server's public IP as source for local connections (vpn mode only)")
         flag.BoolVar(&config.TLS, "tls", false, "Enable TLS encryption (no hostname verification)")
         flag.Parse()
@@ -1323,18 +1397,7 @@ func main() {
                 log.Fatal("Token is required (-token)")
         }
 
-        // Parse bandwidth limit
-        if config.Limit != "" {
-                bytesPerSec, err := parseBandwidthLimit(config.Limit)
-                if err != nil {
-                        log.Fatalf("Invalid bandwidth limit: %v", err)
-                }
-                config.limitBytesPerSec = bytesPerSec
-
-                // Convert to human-readable format (using 1024 multiplier)
-                mbps := float64(bytesPerSec) * 8 / (1024 * 1024)
-                log.Printf("Bandwidth limit: %.2f Mbps (%d bytes/sec) per connection", mbps, bytesPerSec)
-        }
+        log.Printf("CPU pinning enabled - goroutines will be distributed across %d cores", runtime.NumCPU())
 
         switch config.Mode {
         case "relay":
