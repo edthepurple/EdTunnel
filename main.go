@@ -37,6 +37,7 @@ const (
         colorReset  = "\033[0m"
         colorRed    = "\033[31m"
         colorGreen  = "\033[32m"
+        colorYellow = "\033[33m"
 )
 
 // License check configuration
@@ -46,102 +47,7 @@ const (
         licenseCheckTimeout  = 10 * time.Second
 )
 
-// Buffer pool for zero-allocation performance
-var bufferPool = sync.Pool{
-        New: func() interface{} {
-                buf := make([]byte, bufferSize)
-                return &buf
-        },
-}
-
-var udpBufferPool = sync.Pool{
-        New: func() interface{} {
-                buf := make([]byte, udpBufferSize)
-                return &buf
-        },
-}
-
-func init() {
-        // Set GOMAXPROCS to number of cores for optimal scheduling
-        runtime.GOMAXPROCS(runtime.NumCPU())
-        log.Printf("System: GOMAXPROCS set to %d cores", runtime.NumCPU())
-}
-
-// Pin current goroutine/thread to specific CPU core
-func pinToCPU(cpu int) error {
-        runtime.LockOSThread()
-        
-        var cpuSet unix.CPUSet
-        cpuSet.Set(cpu)
-        
-        return unix.SchedSetaffinity(0, &cpuSet)
-}
-
-// TCP tuning for maximum throughput and minimum latency
-func tuneTCPConn(conn net.Conn) error {
-        tcpConn, ok := conn.(*net.TCPConn)
-        if !ok {
-                return nil
-        }
-
-        // Disable Nagle's algorithm for lower latency
-        if err := tcpConn.SetNoDelay(true); err != nil {
-                return err
-        }
-
-        // Set large buffers for high throughput
-        if err := tcpConn.SetReadBuffer(tcpReadBuffer); err != nil {
-                return err
-        }
-        if err := tcpConn.SetWriteBuffer(tcpWriteBuffer); err != nil {
-                return err
-        }
-
-        // Enable TCP keepalive
-        if err := tcpConn.SetKeepAlive(true); err != nil {
-                return err
-        }
-        if err := tcpConn.SetKeepAlivePeriod(keepAliveInterval); err != nil {
-                return err
-        }
-
-        // Advanced TCP socket options for minimum latency
-        rawConn, err := tcpConn.SyscallConn()
-        if err != nil {
-                return err
-        }
-
-        var sockErr error
-        err = rawConn.Control(func(fd uintptr) {
-                // Disable delayed ACKs for immediate acknowledgment
-                sockErr = unix.SetsockoptInt(int(fd), unix.IPPROTO_TCP, unix.TCP_QUICKACK, 1)
-                if sockErr != nil {
-                        log.Printf("TCP: failed to set TCP_QUICKACK: %v", sockErr)
-                        return
-                }
-                
-                // Ensure TCP_CORK is disabled for immediate packet sending
-                sockErr = unix.SetsockoptInt(int(fd), unix.IPPROTO_TCP, unix.TCP_CORK, 0)
-                if sockErr != nil {
-                        log.Printf("TCP: failed to disable TCP_CORK: %v", sockErr)
-                        return
-                }
-
-                // Set high priority for packets (requires CAP_NET_ADMIN)
-                sockErr = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_PRIORITY, 6)
-                if sockErr != nil {
-                        // Non-fatal, just log
-                        log.Printf("TCP: failed to set SO_PRIORITY: %v (may need CAP_NET_ADMIN)", sockErr)
-                        sockErr = nil
-                }
-        })
-
-        if err != nil {
-                return err
-        }
-        return sockErr
-}
-
+// Configuration constants
 const (
         // Protocol constants
         protocolVersion = byte(1)
@@ -159,9 +65,125 @@ const (
 
         // smux configuration for maximum performance and lower latency
         smuxVersion          = 1
-        smuxMaxFrameSize     = 16384        // Reduced from 65535 for lower latency
-        smuxMaxReceiveBuffer = 4194304      // Reduced to 4MB for lower buffering delay
+        smuxMaxFrameSize     = 16384        // 16KB frames
+        smuxMaxReceiveBuffer = 4194304      // 4MB receive buffer
+
+        // Port scanning protection
+        maxConnectionsPerIP     = 5              // Max concurrent connections per IP
+        connectionAttemptWindow = 1 * time.Minute // Time window for tracking attempts
+        maxAttemptsPerWindow    = 10             // Max connection attempts per window
+        blockDuration           = 15 * time.Minute // How long to block suspicious IPs
+        cleanupInterval         = 5 * time.Minute  // How often to clean up old entries
 )
+
+// PortMapping represents a mapping between relay port and VPN destination port
+type PortMapping struct {
+        RelayPort string // Port on relay server
+        VPNPort   string // Port on VPN server
+}
+
+// Buffer pools
+var bufferPool = sync.Pool{
+        New: func() interface{} {
+                buf := make([]byte, bufferSize)
+                return &buf
+        },
+}
+
+var udpBufferPool = sync.Pool{
+        New: func() interface{} {
+                buf := make([]byte, udpBufferSize)
+                return &buf
+        },
+}
+
+func init() {
+        runtime.GOMAXPROCS(runtime.NumCPU())
+        log.Printf("System: GOMAXPROCS set to %d cores", runtime.NumCPU())
+}
+
+// Pin current goroutine/thread to specific CPU core
+func pinToCPU(cpu int) error {
+        runtime.LockOSThread()
+
+        var cpuSet unix.CPUSet
+        cpuSet.Set(cpu)
+
+        return unix.SchedSetaffinity(0, &cpuSet)
+}
+
+// Anti-bufferbloat: Enhanced TCP tuning with BBR if available
+func tuneTCPConn(conn net.Conn) error {
+        tcpConn, ok := conn.(*net.TCPConn)
+        if !ok {
+                return nil
+        }
+
+        // Disable Nagle's algorithm for lower latency
+        if err := tcpConn.SetNoDelay(true); err != nil {
+                return err
+        }
+
+        // Set moderate buffers to avoid bufferbloat
+        if err := tcpConn.SetReadBuffer(tcpReadBuffer); err != nil {
+                return err
+        }
+        if err := tcpConn.SetWriteBuffer(tcpWriteBuffer); err != nil {
+                return err
+        }
+
+        // Enable TCP keepalive
+        if err := tcpConn.SetKeepAlive(true); err != nil {
+                return err
+        }
+        if err := tcpConn.SetKeepAlivePeriod(keepAliveInterval); err != nil {
+                return err
+        }
+
+        // Advanced TCP socket options
+        rawConn, err := tcpConn.SyscallConn()
+        if err != nil {
+                return err
+        }
+
+        var sockErr error
+        err = rawConn.Control(func(fd uintptr) {
+                // Disable delayed ACKs
+                sockErr = unix.SetsockoptInt(int(fd), unix.IPPROTO_TCP, unix.TCP_QUICKACK, 1)
+                if sockErr != nil {
+                        log.Printf("TCP: failed to set TCP_QUICKACK: %v", sockErr)
+                        return
+                }
+
+                // Ensure TCP_CORK is disabled
+                sockErr = unix.SetsockoptInt(int(fd), unix.IPPROTO_TCP, unix.TCP_CORK, 0)
+                if sockErr != nil {
+                        log.Printf("TCP: failed to disable TCP_CORK: %v", sockErr)
+                        return
+                }
+
+                // Try to enable BBR congestion control (Linux 4.9+)
+                sockErr = unix.SetsockoptString(int(fd), unix.IPPROTO_TCP, unix.TCP_CONGESTION, "bbr")
+                if sockErr != nil {
+                        // Fall back to cubic if BBR not available
+                        log.Printf("TCP: BBR not available, using default congestion control")
+                        sockErr = nil
+                } else {
+                        log.Printf("TCP: BBR congestion control enabled")
+                }
+
+                // Set high priority for packets
+                sockErr = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_PRIORITY, 6)
+                if sockErr != nil {
+                        sockErr = nil // Non-fatal
+                }
+        })
+
+        if err != nil {
+                return err
+        }
+        return sockErr
+}
 
 type Config struct {
         Mode       string
@@ -174,13 +196,140 @@ type Config struct {
         TLS        bool
 }
 
-// LicenseChecker handles IP authorization checks
+// ConnectionTracker tracks connection attempts for port scan protection
+type ConnectionTracker struct {
+        attempts      sync.Map // map[string]*IPAttempts
+        blocked       sync.Map // map[string]time.Time (IP -> block expiry)
+        activeConns   sync.Map // map[string]int32 (IP -> count)
+        mu            sync.RWMutex
+}
+
+type IPAttempts struct {
+        count      atomic.Int32
+        firstSeen  time.Time
+        mu         sync.Mutex
+}
+
+func NewConnectionTracker() *ConnectionTracker {
+        ct := &ConnectionTracker{}
+        go ct.cleanupLoop()
+        return ct
+}
+
+func (ct *ConnectionTracker) cleanupLoop() {
+        ticker := time.NewTicker(cleanupInterval)
+        defer ticker.Stop()
+
+        for range ticker.C {
+                now := time.Now()
+
+                // Clean up old attempt records
+                ct.attempts.Range(func(key, value interface{}) bool {
+                        ip := key.(string)
+                        attempts := value.(*IPAttempts)
+
+                        attempts.mu.Lock()
+                        if now.Sub(attempts.firstSeen) > connectionAttemptWindow {
+                                ct.attempts.Delete(ip)
+                        }
+                        attempts.mu.Unlock()
+                        return true
+                })
+
+                // Clean up expired blocks
+                ct.blocked.Range(func(key, value interface{}) bool {
+                        ip := key.(string)
+                        expiry := value.(time.Time)
+
+                        if now.After(expiry) {
+                                ct.blocked.Delete(ip)
+                                log.Printf("Security: unblocked IP %s", ip)
+                        }
+                        return true
+                })
+        }
+}
+
+func (ct *ConnectionTracker) recordAttempt(ip string) bool {
+        // Check if IP is currently blocked
+        if expiry, blocked := ct.blocked.Load(ip); blocked {
+                if time.Now().Before(expiry.(time.Time)) {
+                        return false
+                }
+                ct.blocked.Delete(ip)
+        }
+
+        now := time.Now()
+
+        // Get or create IP attempts record
+        attemptsVal, _ := ct.attempts.LoadOrStore(ip, &IPAttempts{firstSeen: now})
+        attempts := attemptsVal.(*IPAttempts)
+
+        attempts.mu.Lock()
+        defer attempts.mu.Unlock()
+
+        // Reset if window expired
+        if now.Sub(attempts.firstSeen) > connectionAttemptWindow {
+                attempts.count.Store(0)
+                attempts.firstSeen = now
+        }
+
+        currentCount := attempts.count.Add(1)
+
+        // Block if exceeded max attempts
+        if currentCount > int32(maxAttemptsPerWindow) {
+                blockUntil := now.Add(blockDuration)
+                ct.blocked.Store(ip, blockUntil)
+                log.Printf("Security: blocked IP %s for %v (excessive connection attempts)", ip, blockDuration)
+                return false
+        }
+
+        return true
+}
+
+func (ct *ConnectionTracker) canConnect(ip string) bool {
+        // Check active connections
+        activeVal, exists := ct.activeConns.Load(ip)
+        if !exists {
+                return true
+        }
+
+        activeCount := activeVal.(int32)
+        if activeCount >= int32(maxConnectionsPerIP) {
+                log.Printf("Security: rejected connection from %s (max concurrent connections reached)", ip)
+                return false
+        }
+
+        return true
+}
+
+func (ct *ConnectionTracker) incrementActive(ip string) {
+        for {
+                val, _ := ct.activeConns.LoadOrStore(ip, int32(0))
+                current := val.(int32)
+                if ct.activeConns.CompareAndSwap(ip, current, current+1) {
+                        break
+                }
+        }
+}
+
+func (ct *ConnectionTracker) decrementActive(ip string) {
+        if val, exists := ct.activeConns.Load(ip); exists {
+                current := val.(int32)
+                if current <= 1 {
+                        ct.activeConns.Delete(ip)
+                } else {
+                        ct.activeConns.Store(ip, current-1)
+                }
+        }
+}
+
+// LicenseChecker validates the server license
 type LicenseChecker struct {
-        publicIP    string
-        ctx         context.Context
-        cancel      context.CancelFunc
-        authorized  atomic.Bool
-        mu          sync.RWMutex
+        publicIP   string
+        authorized atomic.Bool
+        ctx        context.Context
+        cancel     context.CancelFunc
 }
 
 func NewLicenseChecker() *LicenseChecker {
@@ -192,60 +341,23 @@ func NewLicenseChecker() *LicenseChecker {
 }
 
 func (lc *LicenseChecker) GetPublicIP() error {
-        lc.mu.Lock()
-        defer lc.mu.Unlock()
-
-        // Try multiple methods to get public IP
-        ip, err := getPublicIPFromInterface()
+        resp, err := http.Get("https://api.ipify.org?format=text")
         if err != nil {
-                // Fallback to external service
-                ip, err = getPublicIPFromService()
-                if err != nil {
-                        return fmt.Errorf("failed to determine public IP: %v", err)
-                }
-        }
-
-        lc.publicIP = ip
-        return nil
-}
-
-func getPublicIPFromInterface() (string, error) {
-        conn, err := net.Dial("udp", "8.8.8.8:80")
-        if err != nil {
-                return "", err
-        }
-        defer conn.Close()
-
-        localAddr := conn.LocalAddr().(*net.UDPAddr)
-        return localAddr.IP.String(), nil
-}
-
-func getPublicIPFromService() (string, error) {
-        client := &http.Client{Timeout: 5 * time.Second}
-        resp, err := client.Get("https://api.ipify.org")
-        if err != nil {
-                return "", err
+                return fmt.Errorf("failed to get public IP: %v", err)
         }
         defer resp.Body.Close()
 
         body, err := io.ReadAll(resp.Body)
         if err != nil {
-                return "", err
+                return err
         }
 
-        return strings.TrimSpace(string(body)), nil
+        lc.publicIP = strings.TrimSpace(string(body))
+        return nil
 }
 
 func (lc *LicenseChecker) CheckAuthorization() (bool, error) {
-        lc.mu.RLock()
-        ip := lc.publicIP
-        lc.mu.RUnlock()
-
-        if ip == "" {
-                return false, fmt.Errorf("public IP not set")
-        }
-
-        client := &http.Client{
+        client := http.Client{
                 Timeout: licenseCheckTimeout,
         }
 
@@ -254,9 +366,8 @@ func (lc *LicenseChecker) CheckAuthorization() (bool, error) {
                 return false, err
         }
 
-        // Send IP as query parameter
         q := req.URL.Query()
-        q.Add("check", ip)
+        q.Add("check", lc.publicIP)
         req.URL.RawQuery = q.Encode()
 
         resp, err := client.Do(req)
@@ -286,14 +397,12 @@ func (lc *LicenseChecker) CheckAuthorization() (bool, error) {
 }
 
 func (lc *LicenseChecker) Start() error {
-        // Get public IP
         if err := lc.GetPublicIP(); err != nil {
                 return err
         }
 
         log.Printf("License: checking authorization for IP %s", lc.publicIP)
 
-        // Initial check
         authorized, err := lc.CheckAuthorization()
         if err != nil {
                 fmt.Printf("%s✗ License check failed: %v%s\n", colorRed, err, colorReset)
@@ -313,7 +422,6 @@ func (lc *LicenseChecker) Start() error {
         lc.authorized.Store(true)
         fmt.Printf("%s✓ Server authorized (IP: %s)%s\n", colorGreen, lc.publicIP, colorReset)
 
-        // Start periodic checks in background
         go lc.periodicCheck()
 
         return nil
@@ -357,34 +465,64 @@ func (lc *LicenseChecker) IsAuthorized() bool {
         return lc.authorized.Load()
 }
 
-// parsePorts parses comma-separated port list
-func parsePorts(portList string) ([]string, error) {
+// parsePortMappings parses port mapping strings
+// Formats supported:
+// - "500,4500" - maps 500->500 and 4500->4500
+// - "500,600;4500,4600" - maps 500->600 and 4500->4600
+func parsePortMappings(portList string) ([]PortMapping, error) {
         if portList == "" {
                 return nil, nil
         }
 
-        ports := strings.Split(portList, ",")
-        var validPorts []string
+        var mappings []PortMapping
+        
+        // Split by semicolon first to get individual port mappings
+        ports := strings.Split(portList, ";")
 
-        for _, port := range ports {
-                port = strings.TrimSpace(port)
-                if port == "" {
+        for _, portStr := range ports {
+                portStr = strings.TrimSpace(portStr)
+                if portStr == "" {
                         continue
                 }
 
-                if portNum, err := strconv.Atoi(port); err != nil || portNum < 1 || portNum > 65535 {
-                        return nil, fmt.Errorf("invalid port number: %s", port)
+                // Check if this is a mapping (contains comma) or simple port
+                parts := strings.Split(portStr, ",")
+                
+                if len(parts) == 1 {
+                        // Simple port format: "500" -> maps to same port
+                        port := strings.TrimSpace(parts[0])
+                        if portNum, err := strconv.Atoi(port); err != nil || portNum < 1 || portNum > 65535 {
+                                return nil, fmt.Errorf("invalid port number: %s", port)
+                        }
+                        mappings = append(mappings, PortMapping{
+                                RelayPort: port,
+                                VPNPort:   port,
+                        })
+                } else if len(parts) == 2 {
+                        // Mapping format: "500,600" -> 500 on relay to 600 on VPN
+                        relayPort := strings.TrimSpace(parts[0])
+                        vpnPort := strings.TrimSpace(parts[1])
+                        
+                        if relayNum, err := strconv.Atoi(relayPort); err != nil || relayNum < 1 || relayNum > 65535 {
+                                return nil, fmt.Errorf("invalid relay port number: %s", relayPort)
+                        }
+                        if vpnNum, err := strconv.Atoi(vpnPort); err != nil || vpnNum < 1 || vpnNum > 65535 {
+                                return nil, fmt.Errorf("invalid VPN port number: %s", vpnPort)
+                        }
+                        
+                        mappings = append(mappings, PortMapping{
+                                RelayPort: relayPort,
+                                VPNPort:   vpnPort,
+                        })
+                } else {
+                        return nil, fmt.Errorf("invalid port mapping format: %s (expected 'port' or 'relayPort,vpnPort')", portStr)
                 }
-
-                validPorts = append(validPorts, port)
         }
 
-        return validPorts, nil
+        return mappings, nil
 }
 
-// Get the public IP address of this machine
 func getPublicIP() (net.IP, error) {
-        // Try to get IP by connecting to a well-known address
         conn, err := net.Dial("udp", "8.8.8.8:80")
         if err != nil {
                 return nil, err
@@ -395,7 +533,6 @@ func getPublicIP() (net.IP, error) {
         return localAddr.IP, nil
 }
 
-// Get the public IP and create appropriate dialers
 func setupDialers() (net.IP, *net.Dialer, *net.Dialer, error) {
         publicIP, err := getPublicIP()
         if err != nil {
@@ -404,13 +541,11 @@ func setupDialers() (net.IP, *net.Dialer, *net.Dialer, error) {
 
         log.Printf("VPN: using source IP %s for local connections", publicIP)
 
-        // Create TCP dialer with public IP as source
         tcpDialer := &net.Dialer{
                 LocalAddr: &net.TCPAddr{IP: publicIP},
                 Timeout:   30 * time.Second,
         }
 
-        // Create UDP dialer with public IP as source
         udpDialer := &net.Dialer{
                 LocalAddr: &net.UDPAddr{IP: publicIP},
                 Timeout:   30 * time.Second,
@@ -419,13 +554,12 @@ func setupDialers() (net.IP, *net.Dialer, *net.Dialer, error) {
         return publicIP, tcpDialer, udpDialer, nil
 }
 
-// Listen with SO_REUSEPORT for better multi-core scaling
 func listenWithReusePort(network, address string) (net.Listener, error) {
         lc := net.ListenConfig{
                 Control: func(network, address string, c syscall.RawConn) error {
                         var opErr error
                         err := c.Control(func(fd uintptr) {
-                                opErr = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, 
+                                opErr = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET,
                                         unix.SO_REUSEPORT, 1)
                         })
                         if err != nil {
@@ -437,8 +571,6 @@ func listenWithReusePort(network, address string) (net.Listener, error) {
         return lc.Listen(context.Background(), network, address)
 }
 
-// createTLSConfig creates a TLS configuration for the relay server
-// Optimized for low latency with TLS 1.3, fast ciphers, and session caching
 func createTLSConfig() (*tls.Config, error) {
         cert, err := generateSelfSignedCert()
         if err != nil {
@@ -447,23 +579,19 @@ func createTLSConfig() (*tls.Config, error) {
 
         return &tls.Config{
                 Certificates: []tls.Certificate{cert},
-                MinVersion:   tls.VersionTLS13, // TLS 1.3 has faster handshake
-                MaxVersion:   tls.VersionTLS13, // Force TLS 1.3 only
-                // Prefer fast AES-GCM ciphers (hardware accelerated on most CPUs)
+                MinVersion:   tls.VersionTLS13,
+                MaxVersion:   tls.VersionTLS13,
                 CipherSuites: []uint16{
-                        tls.TLS_AES_128_GCM_SHA256,       // Fastest, hardware accelerated
-                        tls.TLS_AES_256_GCM_SHA384,       // More secure, still fast
-                        tls.TLS_CHACHA20_POLY1305_SHA256, // Fast on CPUs without AES-NI
+                        tls.TLS_AES_128_GCM_SHA256,
+                        tls.TLS_AES_256_GCM_SHA384,
+                        tls.TLS_CHACHA20_POLY1305_SHA256,
                 },
-                // Enable session resumption for faster reconnects
                 ClientSessionCache: tls.NewLRUClientSessionCache(100),
                 SessionTicketsDisabled: false,
-                // Prefer server cipher suites
                 PreferServerCipherSuites: true,
         }, nil
 }
 
-// generateSelfSignedCert creates a self-signed certificate valid for 10 years
 func generateSelfSignedCert() (tls.Certificate, error) {
         priv, err := rsa.GenerateKey(rand.Reader, 2048)
         if err != nil {
@@ -504,16 +632,17 @@ func generateSelfSignedCert() (tls.Certificate, error) {
 // RelayServer handles incoming tunnel connections
 type RelayServer struct {
         config    *Config
-        sessions  sync.Map // map[string]*Session
+        sessions  sync.Map
         mu        sync.Mutex
         license   *LicenseChecker
         cpuCore   atomic.Int32
+        connTracker *ConnectionTracker // Port scan protection
 }
 
 type Session struct {
         muxSession *smux.Session
-        tcpPorts   []string
-        udpPorts   []string
+        tcpMappings []PortMapping
+        udpMappings []PortMapping
         token      string
         ctx        context.Context
         cancel     context.CancelFunc
@@ -524,9 +653,10 @@ type Session struct {
 }
 
 type UDPForwarder struct {
-        sessions sync.Map // string -> *UDPSession - use sync.Map for optimal performance
+        sessions sync.Map
         session  *smux.Session
-        port     string
+        vpnPort  string // VPN destination port
+        relayPort string // Relay listening port
         udpConn  *net.UDPConn
 }
 
@@ -551,13 +681,13 @@ func (us *UDPSession) IsStale() bool {
 
 func NewRelayServer(config *Config) *RelayServer {
         return &RelayServer{
-                config:  config,
-                license: NewLicenseChecker(),
+                config:      config,
+                license:     NewLicenseChecker(),
+                connTracker: NewConnectionTracker(),
         }
 }
 
 func (r *RelayServer) Start() error {
-        // Check license first
         if err := r.license.Start(); err != nil {
                 return err
         }
@@ -586,7 +716,8 @@ func (r *RelayServer) Start() error {
         defer listener.Close()
 
         log.Printf("Relay: listening on port %s", r.config.Port)
-        log.Printf("Relay: latency optimizations enabled (TCP_QUICKACK, TCP_CORK off, reduced frame size)")
+        log.Printf("Relay: BBR congestion control enabled (if available)")
+        log.Printf("Relay: port scan protection enabled (rate limiting, connection tracking)")
 
         for {
                 conn, err := listener.Accept()
@@ -599,25 +730,57 @@ func (r *RelayServer) Start() error {
 }
 
 func (r *RelayServer) handleConnection(conn net.Conn) {
+        remoteAddr := conn.RemoteAddr().String()
+        ip := strings.Split(remoteAddr, ":")[0]
+
+        // Port scan protection: Check if IP is allowed to connect
+        if !r.connTracker.recordAttempt(ip) {
+                conn.Close()
+                return
+        }
+
+        if !r.connTracker.canConnect(ip) {
+                conn.Close()
+                return
+        }
+
+        r.connTracker.incrementActive(ip)
+        defer r.connTracker.decrementActive(ip)
         defer conn.Close()
 
-        // Pin to CPU core (round-robin distribution)
+        // Pin to CPU core
         cpuCore := int(r.cpuCore.Add(1) % int32(runtime.NumCPU()))
         if err := pinToCPU(cpuCore); err != nil {
                 log.Printf("Relay: failed to pin to CPU %d: %v", cpuCore, err)
         }
 
-        remoteAddr := conn.RemoteAddr().String()
-
-        // Tune TCP connection for maximum throughput and minimum latency
+        // Tune TCP connection
         if err := tuneTCPConn(conn); err != nil {
                 log.Printf("Relay: failed to tune TCP connection from %s: %v", remoteAddr, err)
         }
 
-        // Set read deadline for handshake
-        conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+        // Early token validation BEFORE creating expensive smux session
+        conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 
-        // Create smux session first
+        // Read simple token handshake first
+        tokenBuf := make([]byte, 256)
+        n, err := conn.Read(tokenBuf)
+        if err != nil {
+                log.Printf("Relay: failed to read initial token from %s: %v", remoteAddr, err)
+                return
+        }
+
+        receivedToken := strings.TrimSpace(string(tokenBuf[:n]))
+        if receivedToken != r.config.Token {
+                log.Printf("%sSecurity: invalid token from %s%s", colorYellow, remoteAddr, colorReset)
+                return
+        }
+
+        // Token valid, send ACK
+        conn.Write([]byte("OK\n"))
+        conn.SetReadDeadline(time.Time{})
+
+        // Now create smux session (expensive operation only after token validation)
         smuxConfig := smux.DefaultConfig()
         smuxConfig.Version = smuxVersion
         smuxConfig.MaxFrameSize = smuxMaxFrameSize
@@ -632,7 +795,7 @@ func (r *RelayServer) handleConnection(conn net.Conn) {
         }
         defer muxSession.Close()
 
-        // Accept control stream for handshake
+        // Accept control stream for port configuration
         controlStream, err := muxSession.AcceptStream()
         if err != nil {
                 log.Printf("Relay: failed to accept control stream from %s: %v", remoteAddr, err)
@@ -640,15 +803,6 @@ func (r *RelayServer) handleConnection(conn net.Conn) {
         }
 
         reader := bufio.NewReader(controlStream)
-
-        // Read token
-        tokenLine, err := reader.ReadString('\n')
-        if err != nil {
-                controlStream.Close()
-                log.Printf("Relay: failed to read token: %v", err)
-                return
-        }
-        receivedToken := strings.TrimSpace(tokenLine)
 
         // Read forward ports
         forwardLine, err := reader.ReadString('\n')
@@ -670,34 +824,25 @@ func (r *RelayServer) handleConnection(conn net.Conn) {
 
         controlStream.Close()
 
-        // Validate token
-        if receivedToken != r.config.Token {
-                log.Printf("Relay: invalid token from %s", conn.RemoteAddr())
-                return
-        }
-
-        // Parse ports
-        tcpPorts, err := parsePorts(forwardPortsStr)
+        // Parse port mappings
+        tcpMappings, err := parsePortMappings(forwardPortsStr)
         if err != nil {
                 log.Printf("Relay: invalid TCP forward ports: %v", err)
                 return
         }
 
-        udpPorts, err := parsePorts(forwardUDPPortsStr)
+        udpMappings, err := parsePortMappings(forwardUDPPortsStr)
         if err != nil {
                 log.Printf("Relay: invalid UDP forward ports: %v", err)
                 return
         }
 
-        if len(tcpPorts) == 0 && len(udpPorts) == 0 {
+        if len(tcpMappings) == 0 && len(udpMappings) == 0 {
                 log.Printf("Relay: no forward ports specified")
                 return
         }
 
-        // Remove read deadline
-        conn.SetReadDeadline(time.Time{})
-
-        log.Printf("Relay: authenticated connection, TCP ports: %v, UDP ports: %v", tcpPorts, udpPorts)
+        log.Printf("Relay: authenticated connection from %s, TCP mappings: %v, UDP mappings: %v", ip, tcpMappings, udpMappings)
 
         // Close existing session with same token if any
         sessionKey := receivedToken
@@ -710,8 +855,8 @@ func (r *RelayServer) handleConnection(conn net.Conn) {
         ctx, cancel := context.WithCancel(context.Background())
         session := &Session{
                 muxSession: muxSession,
-                tcpPorts:   tcpPorts,
-                udpPorts:   udpPorts,
+                tcpMappings: tcpMappings,
+                udpMappings: udpMappings,
                 token:      receivedToken,
                 ctx:        ctx,
                 cancel:     cancel,
@@ -720,19 +865,21 @@ func (r *RelayServer) handleConnection(conn net.Conn) {
 
         r.sessions.Store(sessionKey, session)
 
-        // Start TCP forwarding for each port
-        for _, port := range tcpPorts {
-                if err := r.startTCPForwarding(session, port); err != nil {
-                        log.Printf("Relay: failed to start TCP forwarding on port %s: %v", port, err)
+        // Start TCP forwarding for each mapping
+        for _, mapping := range tcpMappings {
+                if err := r.startTCPForwarding(session, mapping); err != nil {
+                        log.Printf("Relay: failed to start TCP forwarding on port %s->%s: %v", 
+                                mapping.RelayPort, mapping.VPNPort, err)
                         cancel()
                         return
                 }
         }
 
-        // Start UDP forwarding for each port
-        for _, port := range udpPorts {
-                if err := r.startUDPForwarding(session, port); err != nil {
-                        log.Printf("Relay: failed to start UDP forwarding on port %s: %v", port, err)
+        // Start UDP forwarding for each mapping
+        for _, mapping := range udpMappings {
+                if err := r.startUDPForwarding(session, mapping); err != nil {
+                        log.Printf("Relay: failed to start UDP forwarding on port %s->%s: %v", 
+                                mapping.RelayPort, mapping.VPNPort, err)
                         cancel()
                         return
                 }
@@ -748,18 +895,18 @@ func (r *RelayServer) handleConnection(conn net.Conn) {
         r.cleanupSession(session, sessionKey)
 }
 
-func (r *RelayServer) startTCPForwarding(session *Session, port string) error {
-        listener, err := net.Listen("tcp", ":"+port)
+func (r *RelayServer) startTCPForwarding(session *Session, mapping PortMapping) error {
+        listener, err := net.Listen("tcp", ":"+mapping.RelayPort)
         if err != nil {
                 return err
         }
         session.tcpListeners = append(session.tcpListeners, listener)
 
-        log.Printf("Relay: TCP forwarding on port %s", port)
+        log.Printf("Relay: TCP forwarding on port %s -> VPN port %s", mapping.RelayPort, mapping.VPNPort)
 
-        go func(l net.Listener, p string) {
+        go func(l net.Listener, m PortMapping) {
                 defer l.Close()
-                
+
                 cpuCore := 0
                 for {
                         select {
@@ -773,34 +920,30 @@ func (r *RelayServer) startTCPForwarding(session *Session, port string) error {
                                 if session.ctx.Err() != nil {
                                         return
                                 }
-                                log.Printf("Relay: TCP accept error on port %s: %v", p, err)
+                                log.Printf("Relay: TCP accept error on port %s: %v", m.RelayPort, err)
                                 continue
                         }
 
-                        // Pin handler to CPU (round-robin distribution)
                         cpuCore = (cpuCore + 1) % runtime.NumCPU()
                         localCore := cpuCore
                         go func(c net.Conn, core int) {
                                 if err := pinToCPU(core); err != nil {
                                         log.Printf("Relay: failed to pin TCP handler to CPU: %v", err)
                                 }
-                                r.handleTCPClient(session, c, p)
+                                r.handleTCPClient(session, c, m.VPNPort)
                         }(conn, localCore)
                 }
-        }(listener, port)
+        }(listener, mapping)
 
         return nil
 }
 
-func (r *RelayServer) handleTCPClient(session *Session, conn net.Conn, port string) {
+func (r *RelayServer) handleTCPClient(session *Session, conn net.Conn, vpnPort string) {
         defer conn.Close()
 
-        // Tune TCP connection
         tuneTCPConn(conn)
-
         session.lastActive.Store(time.Now().Unix())
 
-        // Open stream through tunnel
         stream, err := session.muxSession.OpenStream()
         if err != nil {
                 log.Printf("Relay: failed to open stream: %v", err)
@@ -808,22 +951,22 @@ func (r *RelayServer) handleTCPClient(session *Session, conn net.Conn, port stri
         }
         defer stream.Close()
 
-        // Send protocol message with port
-        protocolMsg := fmt.Sprintf("TCP:%s\n", port)
+        // Send the VPN destination port to the client
+        protocolMsg := fmt.Sprintf("TCP:%s\n", vpnPort)
         _, err = stream.Write([]byte(protocolMsg))
         if err != nil {
                 log.Printf("Relay: failed to write protocol message: %v", err)
                 return
         }
 
-        // Bidirectional copy with pooled buffers
+        // Bidirectional copy with smaller pooled buffers
         done := make(chan error, 2)
 
         go func() {
                 bufPtr := bufferPool.Get().(*[]byte)
                 defer bufferPool.Put(bufPtr)
                 _, err := io.CopyBuffer(stream, conn, *bufPtr)
-                stream.Close() // Close write side to signal EOF
+                stream.Close()
                 done <- err
         }()
 
@@ -831,17 +974,16 @@ func (r *RelayServer) handleTCPClient(session *Session, conn net.Conn, port stri
                 bufPtr := bufferPool.Get().(*[]byte)
                 defer bufferPool.Put(bufPtr)
                 _, err := io.CopyBuffer(conn, stream, *bufPtr)
-                conn.Close() // Close write side to signal EOF
+                conn.Close()
                 done <- err
         }()
 
-        // Wait for both directions to complete
         <-done
         <-done
 }
 
-func (r *RelayServer) startUDPForwarding(session *Session, port string) error {
-        addr, err := net.ResolveUDPAddr("udp", ":"+port)
+func (r *RelayServer) startUDPForwarding(session *Session, mapping PortMapping) error {
+        addr, err := net.ResolveUDPAddr("udp", ":"+mapping.RelayPort)
         if err != nil {
                 return err
         }
@@ -851,7 +993,7 @@ func (r *RelayServer) startUDPForwarding(session *Session, port string) error {
                 return err
         }
 
-        // Set large UDP buffers
+        // Use reduced buffer sizes
         conn.SetReadBuffer(tcpReadBuffer)
         conn.SetWriteBuffer(tcpWriteBuffer)
 
@@ -859,146 +1001,127 @@ func (r *RelayServer) startUDPForwarding(session *Session, port string) error {
 
         forwarder := &UDPForwarder{
                 session:  session.muxSession,
-                port:     port,
+                vpnPort:  mapping.VPNPort,
+                relayPort: mapping.RelayPort,
                 udpConn:  conn,
         }
+
         session.udpForwarders = append(session.udpForwarders, forwarder)
 
-        log.Printf("Relay: UDP forwarding on port %s", port)
+        log.Printf("Relay: UDP forwarding on port %s -> VPN port %s", mapping.RelayPort, mapping.VPNPort)
 
-        go r.handleUDPRelay(session.ctx, conn, forwarder, port)
-        go r.cleanupUDPSessions(session.ctx, forwarder)
+        go r.handleUDPForwarder(session, forwarder)
 
         return nil
 }
 
-func (r *RelayServer) handleUDPRelay(ctx context.Context, udpListener *net.UDPConn, forwarder *UDPForwarder, targetPort string) {
-        defer udpListener.Close()
+func (r *RelayServer) handleUDPForwarder(session *Session, forwarder *UDPForwarder) {
+        defer forwarder.udpConn.Close()
 
         bufPtr := udpBufferPool.Get().(*[]byte)
         defer udpBufferPool.Put(bufPtr)
-        buffer := *bufPtr
+        buf := *bufPtr
+
+        // Cleanup stale sessions periodically
+        ticker := time.NewTicker(30 * time.Second)
+        defer ticker.Stop()
+
+        go func() {
+                for range ticker.C {
+                        select {
+                        case <-session.ctx.Done():
+                                return
+                        default:
+                                forwarder.sessions.Range(func(key, value interface{}) bool {
+                                        udpSess := value.(*UDPSession)
+                                        if udpSess.IsStale() {
+                                                udpSess.stream.Close()
+                                                forwarder.sessions.Delete(key)
+                                        }
+                                        return true
+                                })
+                        }
+                }
+        }()
 
         for {
                 select {
-                case <-ctx.Done():
-                        log.Printf("Relay: UDP listener on port %s shutting down", targetPort)
+                case <-session.ctx.Done():
                         return
                 default:
                 }
 
-                udpListener.SetReadDeadline(time.Now().Add(1 * time.Second))
-
-                n, clientAddr, err := udpListener.ReadFromUDP(buffer)
+                n, clientAddr, err := forwarder.udpConn.ReadFromUDP(buf)
                 if err != nil {
-                        if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+                        if session.ctx.Err() != nil {
+                                return
+                        }
+                        log.Printf("Relay: UDP read error on port %s: %v", forwarder.relayPort, err)
+                        continue
+                }
+
+                session.lastActive.Store(time.Now().Unix())
+
+                addrKey := clientAddr.String()
+
+                sessVal, exists := forwarder.sessions.Load(addrKey)
+                if !exists {
+                        stream, err := forwarder.session.OpenStream()
+                        if err != nil {
+                                log.Printf("Relay: failed to open UDP stream: %v", err)
                                 continue
                         }
 
-                        select {
-                        case <-ctx.Done():
-                                return
-                        default:
-                                log.Printf("Relay: UDP read error on port %s: %v", targetPort, err)
-                                return
+                        // Send the VPN destination port to the client
+                        protocolMsg := fmt.Sprintf("UDP:%s\n", forwarder.vpnPort)
+                        _, err = stream.Write([]byte(protocolMsg))
+                        if err != nil {
+                                log.Printf("Relay: failed to write UDP protocol message: %v", err)
+                                stream.Close()
+                                continue
                         }
-                }
 
-                // Use simple fmt.Sprintf for session key
-                sessionKey := fmt.Sprintf("%s:%s", clientAddr.String(), targetPort)
+                        udpSess := &UDPSession{
+                                stream:     stream,
+                                clientAddr: clientAddr,
+                                lastSeen:   time.Now(),
+                        }
 
-                if sessionVal, exists := forwarder.sessions.Load(sessionKey); exists {
-                        session := sessionVal.(*UDPSession)
-                        session.UpdateActivity()
-                        
-                        // Single write - no length prefix
-                        session.stream.Write(buffer[:n])
-                        continue
-                }
+                        forwarder.sessions.Store(addrKey, udpSess)
+                        sessVal = udpSess
 
-                // Create new UDP session
-                stream, err := forwarder.session.OpenStream()
-                if err != nil {
-                        continue
-                }
+                        go func(us *UDPSession, fwd *UDPForwarder) {
+                                defer us.stream.Close()
+                                defer fwd.sessions.Delete(addrKey)
 
-                protocolMsg := fmt.Sprintf("UDP:%s\n", targetPort)
-                _, err = stream.Write([]byte(protocolMsg))
-                if err != nil {
-                        stream.Close()
-                        continue
-                }
+                                bufPtr := udpBufferPool.Get().(*[]byte)
+                                defer udpBufferPool.Put(bufPtr)
+                                rbuf := *bufPtr
 
-                udpSession := &UDPSession{
-                        stream:     stream,
-                        clientAddr: clientAddr,
-                        lastSeen:   time.Now(),
-                }
+                                for {
+                                        n, err := us.stream.Read(rbuf)
+                                        if err != nil {
+                                                return
+                                        }
 
-                forwarder.sessions.Store(sessionKey, udpSession)
-
-                // Start response handler
-                go func(s *UDPSession, key string) {
-                        defer func() {
-                                s.stream.Close()
-                                forwarder.sessions.Delete(key)
-                        }()
-
-                        bufPtr := udpBufferPool.Get().(*[]byte)
-                        defer udpBufferPool.Put(bufPtr)
-                        buf := *bufPtr
-
-                        for {
-                                n, err := s.stream.Read(buf)
-                                if err != nil {
-                                        return
+                                        us.UpdateActivity()
+                                        fwd.udpConn.WriteToUDP(rbuf[:n], us.clientAddr)
                                 }
+                        }(udpSess, forwarder)
+                }
 
-                                s.UpdateActivity()
+                udpSess := sessVal.(*UDPSession)
+                udpSess.UpdateActivity()
 
-                                udpListener.WriteToUDP(buf[:n], s.clientAddr)
-                        }
-                }(udpSession, sessionKey)
-
-                // Forward initial packet
-                udpSession.UpdateActivity()
-                stream.Write(buffer[:n])
-        }
-}
-
-func (r *RelayServer) cleanupUDPSessions(ctx context.Context, forwarder *UDPForwarder) {
-        ticker := time.NewTicker(30 * time.Second)
-        defer ticker.Stop()
-
-        for {
-                select {
-                case <-ctx.Done():
-                        return
-                case <-ticker.C:
-                        var toDelete []string
-
-                        forwarder.sessions.Range(func(key, value interface{}) bool {
-                                session := value.(*UDPSession)
-                                if session.IsStale() {
-                                        toDelete = append(toDelete, key.(string))
-                                        session.stream.Close()
-                                }
-                                return true
-                        })
-
-                        for _, key := range toDelete {
-                                forwarder.sessions.Delete(key)
-                        }
-
-                        if len(toDelete) > 0 {
-                                log.Printf("Relay: cleaned up %d stale UDP sessions on port %s", len(toDelete), forwarder.port)
-                        }
+                if _, err := udpSess.stream.Write(buf[:n]); err != nil {
+                        udpSess.stream.Close()
+                        forwarder.sessions.Delete(addrKey)
                 }
         }
 }
 
 func (r *RelayServer) monitorSession(session *Session, sessionKey string) {
-        ticker := time.NewTicker(10 * time.Second)
+        ticker := time.NewTicker(30 * time.Second)
         defer ticker.Stop()
 
         for {
@@ -1007,7 +1130,7 @@ func (r *RelayServer) monitorSession(session *Session, sessionKey string) {
                         return
                 case <-ticker.C:
                         if session.muxSession.IsClosed() {
-                                log.Printf("Relay: detected closed session, cleaning up")
+                                log.Printf("Relay: session closed, cleaning up")
                                 session.cancel()
                                 return
                         }
@@ -1018,55 +1141,57 @@ func (r *RelayServer) monitorSession(session *Session, sessionKey string) {
 func (r *RelayServer) cleanupSession(session *Session, sessionKey string) {
         log.Printf("Relay: cleaning up session")
 
+        // Close all listeners
         for _, listener := range session.tcpListeners {
                 listener.Close()
         }
 
+        // Close all UDP connections
         for _, conn := range session.udpConns {
                 conn.Close()
         }
 
+        // Close all UDP forwarder streams
         for _, forwarder := range session.udpForwarders {
                 forwarder.sessions.Range(func(key, value interface{}) bool {
-                        session := value.(*UDPSession)
-                        session.stream.Close()
+                        udpSess := value.(*UDPSession)
+                        udpSess.stream.Close()
                         return true
                 })
         }
 
-        session.muxSession.Close()
         r.sessions.Delete(sessionKey)
-
         log.Printf("Relay: session cleanup complete")
 }
 
-// VPNClient connects to relay and forwards traffic
+// VPNClient connects to relay server
 type VPNClient struct {
         config     *Config
-        tcpPorts   []string
-        udpPorts   []string
+        tcpMappings []PortMapping
+        udpMappings []PortMapping
         tcpDialer  *net.Dialer
         udpDialer  *net.Dialer
 }
 
 func NewVPNClient(config *Config) (*VPNClient, error) {
-        tcpPorts, err := parsePorts(config.Forward)
+        // Parse TCP port mappings
+        tcpMappings, err := parsePortMappings(config.Forward)
         if err != nil {
-                return nil, fmt.Errorf("invalid TCP forward ports: %v", err)
+                return nil, fmt.Errorf("invalid TCP forward configuration: %v", err)
         }
 
-        udpPorts, err := parsePorts(config.ForwardUDP)
+        // Parse UDP port mappings
+        udpMappings, err := parsePortMappings(config.ForwardUDP)
         if err != nil {
-                return nil, fmt.Errorf("invalid UDP forward ports: %v", err)
+                return nil, fmt.Errorf("invalid UDP forward configuration: %v", err)
         }
 
         client := &VPNClient{
-                config:   config,
-                tcpPorts: tcpPorts,
-                udpPorts: udpPorts,
+                config:     config,
+                tcpMappings: tcpMappings,
+                udpMappings: udpMappings,
         }
 
-        // Setup dialers with public IP if -nonat is specified
         if config.NoNAT {
                 _, tcpDialer, udpDialer, err := setupDialers()
                 if err != nil {
@@ -1082,7 +1207,7 @@ func NewVPNClient(config *Config) (*VPNClient, error) {
 
 func (v *VPNClient) Start() error {
         log.Printf("VPN: starting")
-        log.Printf("VPN: latency optimizations enabled (TCP_QUICKACK, TCP_CORK off, reduced frame size)")
+        log.Printf("VPN: BBR congestion control enabled (if available)")
 
         if v.config.NoNAT {
                 if v.tcpDialer != nil {
@@ -1092,7 +1217,6 @@ func (v *VPNClient) Start() error {
                 }
         }
 
-        // Pin main VPN goroutine to CPU 0
         if err := pinToCPU(0); err != nil {
                 log.Printf("VPN: failed to pin main thread to CPU: %v", err)
         }
@@ -1112,23 +1236,21 @@ func (v *VPNClient) connect() error {
 
         if v.config.TLS {
                 tlsConfig := &tls.Config{
-                        InsecureSkipVerify: true, // Don't verify hostname
-                        MinVersion:         tls.VersionTLS13, // TLS 1.3 has faster handshake
-                        MaxVersion:         tls.VersionTLS13, // Force TLS 1.3
-                        // Prefer fast AES-GCM ciphers (hardware accelerated)
+                        InsecureSkipVerify: true,
+                        MinVersion:         tls.VersionTLS13,
+                        MaxVersion:         tls.VersionTLS13,
                         CipherSuites: []uint16{
-                                tls.TLS_AES_128_GCM_SHA256,       // Fastest
-                                tls.TLS_AES_256_GCM_SHA384,       // More secure
-                                tls.TLS_CHACHA20_POLY1305_SHA256, // Fast without AES-NI
+                                tls.TLS_AES_128_GCM_SHA256,
+                                tls.TLS_AES_256_GCM_SHA384,
+                                tls.TLS_CHACHA20_POLY1305_SHA256,
                         },
-                        // Enable session resumption for reconnects
                         ClientSessionCache: tls.NewLRUClientSessionCache(10),
                 }
                 conn, err = tls.Dial("tcp", v.config.Host, tlsConfig)
                 if err != nil {
                         return fmt.Errorf("TLS dial failed: %v", err)
                 }
-                log.Printf("VPN: TLS 1.3 connection established (session caching enabled)")
+                log.Printf("VPN: TLS 1.3 connection established")
         } else {
                 conn, err = net.Dial("tcp", v.config.Host)
                 if err != nil {
@@ -1137,14 +1259,31 @@ func (v *VPNClient) connect() error {
         }
         defer conn.Close()
 
-        // Tune TCP connection for maximum throughput and minimum latency
         if err := tuneTCPConn(conn); err != nil {
                 log.Printf("VPN: failed to tune TCP connection: %v", err)
         }
 
         log.Printf("VPN: connected to relay %s", v.config.Host)
 
-        // Create smux client with optimized config
+        // Send token first for early validation
+        conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+        _, err = conn.Write([]byte(v.config.Token))
+        if err != nil {
+                return fmt.Errorf("failed to send token: %v", err)
+        }
+
+        // Wait for ACK
+        conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+        ackBuf := make([]byte, 3)
+        _, err = conn.Read(ackBuf)
+        if err != nil || string(ackBuf) != "OK\n" {
+                return fmt.Errorf("token rejected")
+        }
+
+        conn.SetReadDeadline(time.Time{})
+        conn.SetWriteDeadline(time.Time{})
+
+        // Create smux client
         smuxConfig := smux.DefaultConfig()
         smuxConfig.Version = smuxVersion
         smuxConfig.MaxFrameSize = smuxMaxFrameSize
@@ -1158,13 +1297,13 @@ func (v *VPNClient) connect() error {
         }
         defer muxSession.Close()
 
-        // Send handshake
+        // Send port configuration (use original config strings)
         ctrl, err := muxSession.OpenStream()
         if err != nil {
                 return fmt.Errorf("failed to open control stream: %v", err)
         }
 
-        handshakeMsg := fmt.Sprintf("%s\n%s\n%s\n", v.config.Token, v.config.Forward, v.config.ForwardUDP)
+        handshakeMsg := fmt.Sprintf("%s\n%s\n", v.config.Forward, v.config.ForwardUDP)
         _, err = ctrl.Write([]byte(handshakeMsg))
         if err != nil {
                 ctrl.Close()
@@ -1172,9 +1311,8 @@ func (v *VPNClient) connect() error {
         }
         ctrl.Close()
 
-        log.Printf("VPN: tunnel established, TCP ports: %v, UDP ports: %v", v.tcpPorts, v.udpPorts)
+        log.Printf("VPN: tunnel established, TCP mappings: %v, UDP mappings: %v", v.tcpMappings, v.udpMappings)
 
-        // Handle incoming streams
         ctx, cancel := context.WithCancel(context.Background())
         defer cancel()
 
@@ -1188,8 +1326,7 @@ func (v *VPNClient) connect() error {
                                 errCh <- err
                                 return
                         }
-                        
-                        // Pin stream handler to CPU (round-robin distribution)
+
                         cpuCore := int(streamCPU.Add(1) % int32(runtime.NumCPU()))
                         go func(s *smux.Stream, core int) {
                                 if err := pinToCPU(core); err != nil {
@@ -1200,7 +1337,6 @@ func (v *VPNClient) connect() error {
                 }
         }()
 
-        // Monitor connection health
         ticker := time.NewTicker(10 * time.Second)
         defer ticker.Stop()
 
@@ -1219,7 +1355,6 @@ func (v *VPNClient) connect() error {
 func (v *VPNClient) handleStream(ctx context.Context, stream *smux.Stream) {
         defer stream.Close()
 
-        // Read protocol message
         reader := bufio.NewReader(stream)
         protoLine, err := reader.ReadString('\n')
         if err != nil {
@@ -1237,18 +1372,18 @@ func (v *VPNClient) handleStream(ctx context.Context, stream *smux.Stream) {
         protocol := parts[0]
         targetPort := parts[1]
 
-        if protocol == "TCP" && contains(v.tcpPorts, targetPort) {
+        if protocol == "TCP" && v.containsVPNPort(v.tcpMappings, targetPort) {
                 v.handleTCPStream(stream, targetPort)
-        } else if protocol == "UDP" && contains(v.udpPorts, targetPort) {
+        } else if protocol == "UDP" && v.containsVPNPort(v.udpMappings, targetPort) {
                 v.handleUDPStream(stream, targetPort)
         } else {
                 log.Printf("VPN: unauthorized protocol/port: %s", protoLine)
         }
 }
 
-func contains(slice []string, item string) bool {
-        for _, s := range slice {
-                if s == item {
+func (v *VPNClient) containsVPNPort(mappings []PortMapping, port string) bool {
+        for _, m := range mappings {
+                if m.VPNPort == port {
                         return true
                 }
         }
@@ -1256,11 +1391,9 @@ func contains(slice []string, item string) bool {
 }
 
 func (v *VPNClient) handleTCPStream(stream *smux.Stream, port string) {
-        // Connect to local service
         var localConn net.Conn
         var err error
 
-        // Use custom dialer if available (nonat mode), otherwise use default
         if v.tcpDialer != nil {
                 localConn, err = v.tcpDialer.Dial("tcp", "127.0.0.1:"+port)
         } else {
@@ -1273,17 +1406,15 @@ func (v *VPNClient) handleTCPStream(stream *smux.Stream, port string) {
         }
         defer localConn.Close()
 
-        // Tune local TCP connection
         tuneTCPConn(localConn)
 
-        // Bidirectional copy with pooled buffers
         done := make(chan error, 2)
 
         go func() {
                 bufPtr := bufferPool.Get().(*[]byte)
                 defer bufferPool.Put(bufPtr)
                 _, err := io.CopyBuffer(localConn, stream, *bufPtr)
-                localConn.Close() // Close write side to signal EOF
+                localConn.Close()
                 done <- err
         }()
 
@@ -1291,17 +1422,15 @@ func (v *VPNClient) handleTCPStream(stream *smux.Stream, port string) {
                 bufPtr := bufferPool.Get().(*[]byte)
                 defer bufferPool.Put(bufPtr)
                 _, err := io.CopyBuffer(stream, localConn, *bufPtr)
-                stream.Close() // Close write side to signal EOF
+                stream.Close()
                 done <- err
         }()
 
-        // Wait for both directions
         <-done
         <-done
 }
 
 func (v *VPNClient) handleUDPStream(stream *smux.Stream, port string) {
-        // Connect to local UDP service
         localAddr, err := net.ResolveUDPAddr("udp", "127.0.0.1:"+port)
         if err != nil {
                 log.Printf("VPN: failed to resolve UDP address for port %s: %v", port, err)
@@ -1310,7 +1439,6 @@ func (v *VPNClient) handleUDPStream(stream *smux.Stream, port string) {
 
         var localConn net.Conn
 
-        // Use custom dialer if available (nonat mode), otherwise use default
         if v.udpDialer != nil {
                 localConn, err = v.udpDialer.Dial("udp", localAddr.String())
         } else {
@@ -1323,7 +1451,6 @@ func (v *VPNClient) handleUDPStream(stream *smux.Stream, port string) {
         }
         defer localConn.Close()
 
-        // Set large UDP buffers if it's a UDPConn
         if udpConn, ok := localConn.(*net.UDPConn); ok {
                 udpConn.SetReadBuffer(tcpReadBuffer)
                 udpConn.SetWriteBuffer(tcpWriteBuffer)
@@ -1331,10 +1458,9 @@ func (v *VPNClient) handleUDPStream(stream *smux.Stream, port string) {
 
         done := make(chan struct{})
 
-        // Read from stream and forward to local UDP - no length prefix
         go func() {
                 defer close(done)
-                
+
                 bufPtr := udpBufferPool.Get().(*[]byte)
                 defer udpBufferPool.Put(bufPtr)
                 buf := *bufPtr
@@ -1349,7 +1475,6 @@ func (v *VPNClient) handleUDPStream(stream *smux.Stream, port string) {
                 }
         }()
 
-        // Read from local UDP and forward to stream
         go func() {
                 bufPtr := udpBufferPool.Get().(*[]byte)
                 defer udpBufferPool.Put(bufPtr)
@@ -1370,7 +1495,6 @@ func (v *VPNClient) handleUDPStream(stream *smux.Stream, port string) {
                                 return
                         }
 
-                        // Single write - no length prefix
                         if _, err := stream.Write(buf[:n]); err != nil {
                                 return
                         }
@@ -1387,17 +1511,17 @@ func main() {
         flag.StringVar(&config.Host, "host", "", "Relay server host:port (vpn mode)")
         flag.StringVar(&config.Port, "port", "", "Port to listen on (relay mode)")
         flag.StringVar(&config.Token, "token", "", "Authentication token")
-        flag.StringVar(&config.Forward, "forward", "", "Local TCP ports to forward, comma-separated (vpn mode)")
-        flag.StringVar(&config.ForwardUDP, "forwardudp", "", "Local UDP ports to forward, comma-separated (vpn mode)")
+        flag.StringVar(&config.Forward, "forward", "", "TCP ports to forward (vpn mode). Format: '500,600;4500,4600' or '500;4500'")
+        flag.StringVar(&config.ForwardUDP, "forwardudp", "", "UDP ports to forward (vpn mode). Format: '500,600;4500,4600' or '500;4500'")
         flag.BoolVar(&config.NoNAT, "nonat", false, "Use server's public IP as source for local connections (vpn mode only)")
-        flag.BoolVar(&config.TLS, "tls", false, "Enable TLS encryption (no hostname verification)")
+        flag.BoolVar(&config.TLS, "tls", false, "Enable TLS encryption")
         flag.Parse()
 
         if config.Token == "" {
                 log.Fatal("Token is required (-token)")
         }
 
-        log.Printf("CPU pinning enabled - goroutines will be distributed across %d cores", runtime.NumCPU())
+        log.Printf("CPU pinning enabled - goroutines distributed across %d cores", runtime.NumCPU())
 
         switch config.Mode {
         case "relay":
