@@ -1,1104 +1,841 @@
 package main
 
 import (
-	"crypto/rand"
 	"encoding/binary"
 	"flag"
-	"fmt"
 	"io"
 	"log"
 	"net"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/xtaci/smux"
 )
 
 const (
-	keepAliveInterval = 10 * time.Second
-	keepAliveTimeout  = 30 * time.Second
-	reconnectDelay    = 2 * time.Second
-	udpTimeout        = 90 * time.Second
-	bufferSize        = 32 * 1024
-	udpBufferSize     = 64 * 1024
-	udpBatchSize      = 16
-	healthCheckPeriod = 5 * time.Second
+	TCP_FORWARD  = 1
+	UDP_FORWARD  = 2
+	SO_REUSEPORT = 15 // Linux SO_REUSEPORT
 )
 
-type ForwardMapping struct {
-	SrcPort    string
-	TargetPort string
-	IsUDP      bool
-}
-
-type RelaySession struct {
-	session   *smux.Session
-	listeners map[string]net.Listener
-	udpConns  map[string]*net.UDPConn
-	mu        sync.Mutex
+type ForwardRule struct {
+	srcPort    string
+	targetPort string
+	proto      int
 }
 
 type UDPSession struct {
-	clientAddr *net.UDPAddr
+	conn       *net.UDPConn
 	stream     *smux.Stream
+	clientAddr *net.UDPAddr
 	lastActive time.Time
-	writeChan  chan []byte
 	mu         sync.Mutex
 }
 
 type RelayConnection struct {
-	host        string
-	port        string
-	session     *smux.Session
-	conn        net.Conn
-	healthy     atomic.Bool
-	lastSuccess time.Time
-	failures    atomic.Int32
-	mu          sync.RWMutex
+	host      string
+	conn      net.Conn
+	session   *smux.Session
+	active    atomic.Bool
+	connected atomic.Bool
+	lastCheck time.Time
+	mu        sync.Mutex
 }
 
-type RelayPool struct {
-	relays   []*RelayConnection
-	current  atomic.Uint32
-	token    string
-	mappings []ForwardMapping
-	mu       sync.RWMutex
+type RelayManager struct {
+	relays        []*RelayConnection
+	activeRelay   atomic.Value // *RelayConnection
+	token         string
+	forwardRules  string
+	strategy      string // "multi" or "failover"
+	reconnectChan chan string
+	mu            sync.RWMutex
 }
+
+var (
+	mode       = flag.String("mode", "", "Mode: relay or vpn")
+	port       = flag.String("port", "", "Relay server port")
+	host       = flag.String("host", "", "Relay server host:port (comma-separated for multiple servers)")
+	token      = flag.String("token", "", "Authentication token")
+	forward    = flag.String("forward", "", "TCP port forwarding (src,target;src,target)")
+	forwardudp = flag.String("forwardudp", "", "UDP port forwarding (src,target;src,target)")
+	strategy   = flag.String("strategy", "multi", "Strategy: multi (all relays active) or failover (one active at a time)")
+)
 
 func main() {
-	mode := flag.String("mode", "", "Mode: relay or vpn")
-	host := flag.String("host", "", "Relay server host(s), comma-separated for multiple (used in vpn mode)")
-	port := flag.String("port", "", "Port to listen on (relay) or connect to (vpn)")
-	forward := flag.String("forward", "", "TCP port mappings: SRC:TARGET,SRC:TARGET (used in vpn mode)")
-	forwardUDP := flag.String("forwardudp", "", "UDP port mappings: SRC:TARGET,SRC:TARGET (used in vpn mode)")
-	token := flag.String("token", "", "Authentication token")
-	strategy := flag.String("strategy", "failover", "Multi-relay strategy: failover or loadbalance")
-
 	flag.Parse()
 
 	if *token == "" {
-		log.Fatal("Authentication token is required (-token)")
+		log.Fatal("Token is required")
 	}
 
-	switch *mode {
-	case "relay":
+	if *mode == "relay" {
 		if *port == "" {
-			log.Fatal("Relay mode requires -port")
+			log.Fatal("Port is required for relay mode")
 		}
-		runRelay(*port, *token)
-	case "vpn":
-		if *host == "" || *port == "" {
-			log.Fatal("VPN mode requires -host and -port")
+		runRelay()
+	} else if *mode == "vpn" {
+		if *host == "" {
+			log.Fatal("Host is required for vpn mode")
 		}
-		mappings := parseForwardMappings(*forward, *forwardUDP)
-		if len(mappings) == 0 {
-			log.Fatal("VPN mode requires at least one -forward or -forwardudp mapping")
-		}
-		runVPNMulti(*host, *port, *token, mappings, *strategy)
-	default:
-		log.Fatal("Invalid mode. Use -mode relay or -mode vpn")
+		runVPN()
+	} else {
+		log.Fatal("Invalid mode. Use 'relay' or 'vpn'")
 	}
 }
 
-func parseForwardMappings(tcpMappings, udpMappings string) []ForwardMapping {
-	var result []ForwardMapping
-
-	if tcpMappings != "" {
-		for _, mapping := range strings.Split(tcpMappings, ",") {
-			parts := strings.Split(strings.TrimSpace(mapping), ":")
-			if len(parts) == 2 {
-				result = append(result, ForwardMapping{
-					SrcPort:    strings.TrimSpace(parts[0]),
-					TargetPort: strings.TrimSpace(parts[1]),
-					IsUDP:      false,
-				})
-			}
-		}
-	}
-
-	if udpMappings != "" {
-		for _, mapping := range strings.Split(udpMappings, ",") {
-			parts := strings.Split(strings.TrimSpace(mapping), ":")
-			if len(parts) == 2 {
-				result = append(result, ForwardMapping{
-					SrcPort:    strings.TrimSpace(parts[0]),
-					TargetPort: strings.TrimSpace(parts[1]),
-					IsUDP:      true,
-				})
-			}
-		}
-	}
-
-	return result
-}
-
-func runRelay(port, token string) {
-	listener, err := net.Listen("tcp", ":"+port)
+func runRelay() {
+	listener, err := createReusableListener("tcp", ":"+*port)
 	if err != nil {
-		log.Fatalf("Relay: failed to listen on port %s: %v", port, err)
+		log.Fatalf("Failed to start relay server: %v", err)
 	}
 	defer listener.Close()
 
-	log.Printf("Relay: listening on port %s", port)
+	log.Printf("Relay server listening on :%s", *port)
 
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
-			log.Printf("Relay: failed to accept connection: %v", err)
+			log.Printf("Accept error: %v", err)
 			continue
 		}
 
-		go handleRelayConnection(conn, token)
+		go handleRelayConnection(conn)
 	}
 }
 
-func handleRelayConnection(conn net.Conn, expectedToken string) {
+func handleRelayConnection(conn net.Conn) {
 	defer conn.Close()
 
-	conn.SetDeadline(time.Now().Add(10 * time.Second))
-	if !authenticate(conn, expectedToken, false) {
-		log.Printf("Relay: authentication failed from %s", conn.RemoteAddr())
+	// Disable Nagle's algorithm on tunnel connection for lower latency
+	if tcpConn, ok := conn.(*net.TCPConn); ok {
+		tcpConn.SetNoDelay(true)
+	}
+
+	// Authenticate
+	buf := make([]byte, 1024)
+	n, err := conn.Read(buf)
+	if err != nil || string(buf[:n]) != *token {
+		log.Printf("Authentication failed from %s", conn.RemoteAddr())
 		return
 	}
-	conn.SetDeadline(time.Time{})
 
-	log.Printf("Relay: authenticated connection from %s", conn.RemoteAddr())
+	conn.Write([]byte("OK"))
+	log.Printf("VPN server authenticated: %s", conn.RemoteAddr())
 
+	// Receive forward rules from VPN client
+	lenBuf := make([]byte, 2)
+	if _, err := io.ReadFull(conn, lenBuf); err != nil {
+		log.Printf("Failed to read forward rules length: %v", err)
+		return
+	}
+	ruleLen := binary.BigEndian.Uint16(lenBuf)
+	ruleBuf := make([]byte, ruleLen)
+	if _, err := io.ReadFull(conn, ruleBuf); err != nil {
+		log.Printf("Failed to read forward rules: %v", err)
+		return
+	}
+
+	// Parse received rules: "tcp_rules|udp_rules"
+	parts := strings.Split(string(ruleBuf), "|")
+	var forwardRules, forwardudpRules string
+	if len(parts) >= 1 {
+		forwardRules = parts[0]
+	}
+	if len(parts) >= 2 {
+		forwardudpRules = parts[1]
+	}
+
+	log.Printf("Received forward rules - TCP: %s, UDP: %s", forwardRules, forwardudpRules)
+
+	// Create smux session with optimized config to reduce latency
 	smuxConfig := smux.DefaultConfig()
-	smuxConfig.KeepAliveInterval = keepAliveInterval
-	smuxConfig.KeepAliveTimeout = keepAliveTimeout
-	smuxConfig.MaxFrameSize = bufferSize
-	smuxConfig.MaxReceiveBuffer = 4 * 1024 * 1024
+	smuxConfig.MaxReceiveBuffer = 4194304              // 4MB receive buffer
+	smuxConfig.MaxStreamBuffer = 1048576               // 1MB per stream (reduced to fight bufferbloat)
+	smuxConfig.KeepAliveInterval = 10 * time.Second
+	smuxConfig.KeepAliveTimeout = 30 * time.Second
 
 	session, err := smux.Server(conn, smuxConfig)
 	if err != nil {
-		log.Printf("Relay: failed to create smux session: %v", err)
+		log.Printf("Failed to create smux session: %v", err)
 		return
 	}
 	defer session.Close()
 
-	log.Printf("Relay: smux session established")
+	// Parse forward rules
+	tcpRules := parseForwardRules(forwardRules, TCP_FORWARD)
+	udpRules := parseForwardRules(forwardudpRules, UDP_FORWARD)
 
-	rs := &RelaySession{
-		session:   session,
-		listeners: make(map[string]net.Listener),
-		udpConns:  make(map[string]*net.UDPConn),
+	// Track listeners for cleanup
+	var listeners []io.Closer
+	var listenersMu sync.Mutex
+
+	// Start TCP forwarders
+	for _, rule := range tcpRules {
+		listener, err := createReusableListener("tcp", ":"+rule.srcPort)
+		if err != nil {
+			log.Printf("Failed to listen on TCP port %s: %v", rule.srcPort, err)
+			continue
+		}
+		listenersMu.Lock()
+		listeners = append(listeners, listener)
+		listenersMu.Unlock()
+
+		go startTCPForwarderWithListener(session, rule, listener)
 	}
 
-	stopChan := make(chan struct{})
-	var wg sync.WaitGroup
-
-	go func() {
-		for {
-			stream, err := session.AcceptStream()
-			if err != nil {
-				log.Printf("Relay: session closed: %v", err)
-				close(stopChan)
-				return
-			}
-
-			wg.Add(1)
-			go func(s *smux.Stream) {
-				defer wg.Done()
-				handleRelayStream(s, rs)
-			}(stream)
+	// Start UDP forwarders
+	for _, rule := range udpRules {
+		addr, err := net.ResolveUDPAddr("udp", ":"+rule.srcPort)
+		if err != nil {
+			log.Printf("Failed to resolve UDP address %s: %v", rule.srcPort, err)
+			continue
 		}
-	}()
+		conn, err := createReusableUDPListener(addr)
+		if err != nil {
+			log.Printf("Failed to listen on UDP port %s: %v", rule.srcPort, err)
+			continue
+		}
+		listenersMu.Lock()
+		listeners = append(listeners, conn)
+		listenersMu.Unlock()
 
-	<-stopChan
+		go startUDPForwarderWithConn(session, rule, conn)
+	}
 
-	rs.mu.Lock()
-	for _, l := range rs.listeners {
+	// Keep connection alive while session is active
+	for !session.IsClosed() {
+		time.Sleep(1 * time.Second)
+	}
+
+	// Cleanup all listeners
+	log.Printf("Session closed, cleaning up listeners...")
+	time.Sleep(100 * time.Millisecond) // Grace period for in-flight operations
+	listenersMu.Lock()
+	for _, l := range listeners {
 		l.Close()
 	}
-	for _, u := range rs.udpConns {
-		u.Close()
-	}
-	rs.mu.Unlock()
-
-	wg.Wait()
-	log.Printf("Relay: connection from %s closed", conn.RemoteAddr())
+	listenersMu.Unlock()
+	log.Printf("Cleanup complete, ready for reconnection")
 }
 
-func handleRelayStream(stream *smux.Stream, rs *RelaySession) {
-	defer stream.Close()
+func startTCPForwarderWithListener(session *smux.Session, rule ForwardRule, listener net.Listener) {
+	defer listener.Close()
 
-	header := make([]byte, 1)
-	if _, err := io.ReadFull(stream, header); err != nil {
-		return
-	}
+	log.Printf("Forwarding TCP %s -> %s", rule.srcPort, rule.targetPort)
 
-	msgType := header[0]
-
-	switch msgType {
-	case 0x01:
-		handleTCPForward(stream, rs)
-	case 0x02:
-		handleUDPForward(stream, rs)
-	}
-}
-
-func handleTCPForward(stream *smux.Stream, rs *RelaySession) {
-	portLen := make([]byte, 2)
-	if _, err := io.ReadFull(stream, portLen); err != nil {
-		return
-	}
-
-	portBytes := make([]byte, binary.BigEndian.Uint16(portLen))
-	if _, err := io.ReadFull(stream, portBytes); err != nil {
-		return
-	}
-	srcPort := string(portBytes)
-
-	rs.mu.Lock()
-	listener, exists := rs.listeners[srcPort]
-	if !exists {
-		var err error
-		listener, err = net.Listen("tcp", ":"+srcPort)
+	for {
+		conn, err := listener.Accept()
 		if err != nil {
-			rs.mu.Unlock()
-			log.Printf("Relay: failed to listen on TCP port %s: %v", srcPort, err)
 			return
 		}
-		rs.listeners[srcPort] = listener
-		log.Printf("Relay: listening on TCP port %s", srcPort)
 
-		go func(l net.Listener, port string) {
-			for {
-				clientConn, err := l.Accept()
-				if err != nil {
-					return
-				}
-				go handleTCPClient(clientConn, port, rs.session)
+		go func(c net.Conn) {
+			defer c.Close()
+
+			// Disable Nagle's algorithm for lower latency
+			if tcpConn, ok := c.(*net.TCPConn); ok {
+				tcpConn.SetNoDelay(true)
 			}
-		}(listener, srcPort)
+
+			stream, err := session.OpenStream()
+			if err != nil {
+				return
+			}
+			defer stream.Close()
+
+			// Send forward header
+			header := []byte{TCP_FORWARD}
+			portBytes := []byte(rule.targetPort)
+			header = append(header, byte(len(portBytes)))
+			header = append(header, portBytes...)
+			stream.Write(header)
+
+			// Bidirectional copy with small chunks to reduce latency
+			var wg sync.WaitGroup
+			wg.Add(2)
+
+			// Client to stream
+			go func() {
+				defer wg.Done()
+				buf := make([]byte, 16384) // 16KB chunks
+				for {
+					n, err := c.Read(buf)
+					if err != nil {
+						stream.Close()
+						return
+					}
+					if _, err := stream.Write(buf[:n]); err != nil {
+						return
+					}
+				}
+			}()
+
+			// Stream to client
+			go func() {
+				defer wg.Done()
+				buf := make([]byte, 16384) // 16KB chunks
+				for {
+					n, err := stream.Read(buf)
+					if err != nil {
+						c.Close()
+						return
+					}
+					if _, err := c.Write(buf[:n]); err != nil {
+						return
+					}
+				}
+			}()
+
+			wg.Wait()
+		}(conn)
 	}
-	rs.mu.Unlock()
 }
 
-func handleTCPClient(clientConn net.Conn, srcPort string, session *smux.Session) {
-	defer clientConn.Close()
+func startUDPForwarderWithConn(session *smux.Session, rule ForwardRule, conn *net.UDPConn) {
+	defer conn.Close()
 
-	stream, err := session.OpenStream()
-	if err != nil {
-		return
-	}
-	defer stream.Close()
+	log.Printf("Forwarding UDP %s -> %s", rule.srcPort, rule.targetPort)
 
-	header := []byte{0x04}
-	portBytes := []byte(srcPort)
-	portLen := make([]byte, 2)
-	binary.BigEndian.PutUint16(portLen, uint16(len(portBytes)))
+	sessions := make(map[string]*UDPSession)
+	var sessionsMu sync.RWMutex
 
-	if _, err := stream.Write(header); err != nil {
-		return
-	}
-	if _, err := stream.Write(portLen); err != nil {
-		return
-	}
-	if _, err := stream.Write(portBytes); err != nil {
-		return
-	}
-
-	var wg sync.WaitGroup
-	wg.Add(2)
-
-	go func() {
-		defer wg.Done()
-		io.Copy(stream, clientConn)
-		stream.Close()
-	}()
-
-	go func() {
-		defer wg.Done()
-		io.Copy(clientConn, stream)
-		clientConn.Close()
-	}()
-
-	wg.Wait()
-}
-
-func handleUDPForward(stream *smux.Stream, rs *RelaySession) {
-	portLen := make([]byte, 2)
-	if _, err := io.ReadFull(stream, portLen); err != nil {
-		return
-	}
-
-	portBytes := make([]byte, binary.BigEndian.Uint16(portLen))
-	if _, err := io.ReadFull(stream, portBytes); err != nil {
-		return
-	}
-	srcPort := string(portBytes)
-
-	rs.mu.Lock()
-	udpConn, exists := rs.udpConns[srcPort]
-	if !exists {
-		addr, err := net.ResolveUDPAddr("udp", ":"+srcPort)
-		if err != nil {
-			rs.mu.Unlock()
-			return
-		}
-		udpConn, err = net.ListenUDP("udp", addr)
-		if err != nil {
-			rs.mu.Unlock()
-			log.Printf("Relay: failed to listen on UDP port %s: %v", srcPort, err)
-			return
-		}
-
-		if err := udpConn.SetReadBuffer(udpBufferSize); err != nil {
-			log.Printf("Relay: failed to set UDP read buffer: %v", err)
-		}
-		if err := udpConn.SetWriteBuffer(udpBufferSize); err != nil {
-			log.Printf("Relay: failed to set UDP write buffer: %v", err)
-		}
-
-		rs.udpConns[srcPort] = udpConn
-		log.Printf("Relay: listening on UDP port %s", srcPort)
-
-		go handleUDPListener(udpConn, srcPort, rs.session)
-	}
-	rs.mu.Unlock()
-}
-
-func handleUDPListener(udpConn *net.UDPConn, srcPort string, session *smux.Session) {
-	sessions := &sync.Map{}
-
+	// Cleanup stale sessions
+	stopCleanup := make(chan struct{})
 	go func() {
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
-		for range ticker.C {
-			now := time.Now()
-			sessions.Range(func(key, value interface{}) bool {
-				sess := value.(*UDPSession)
-				sess.mu.Lock()
-				if now.Sub(sess.lastActive) > udpTimeout {
-					close(sess.writeChan)
-					sess.stream.Close()
-					sessions.Delete(key)
+		for {
+			select {
+			case <-stopCleanup:
+				return
+			case <-ticker.C:
+				sessionsMu.Lock()
+				now := time.Now()
+				for key, sess := range sessions {
+					sess.mu.Lock()
+					if now.Sub(sess.lastActive) > 2*time.Minute {
+						sess.stream.Close()
+						delete(sessions, key)
+					}
+					sess.mu.Unlock()
 				}
-				sess.mu.Unlock()
-				return true
-			})
+				sessionsMu.Unlock()
+			}
 		}
 	}()
+	defer close(stopCleanup)
 
-	packetPool := sync.Pool{
-		New: func() interface{} {
-			return make([]byte, 2048)
-		},
-	}
-
+	buf := make([]byte, 16384) // Reduced from 65535 to 16KB for lower latency
 	for {
-		buffer := packetPool.Get().([]byte)
-		n, addr, err := udpConn.ReadFromUDP(buffer)
+		n, clientAddr, err := conn.ReadFromUDP(buf)
 		if err != nil {
-			packetPool.Put(buffer)
+			// Cleanup all sessions before exiting
+			sessionsMu.Lock()
+			for _, sess := range sessions {
+				sess.stream.Close()
+			}
+			sessionsMu.Unlock()
 			return
 		}
 
-		addrKey := addr.String()
+		sessionKey := clientAddr.String()
 
-		var sess *UDPSession
-		if val, ok := sessions.Load(addrKey); ok {
-			sess = val.(*UDPSession)
-			sess.mu.Lock()
-			sess.lastActive = time.Now()
-			sess.mu.Unlock()
-		} else {
+		sessionsMu.RLock()
+		sess, exists := sessions[sessionKey]
+		sessionsMu.RUnlock()
+
+		if !exists {
 			stream, err := session.OpenStream()
 			if err != nil {
-				packetPool.Put(buffer)
 				continue
 			}
 
-			header := []byte{0x05}
-			portBytes := []byte(srcPort)
-			portLen := make([]byte, 2)
-			binary.BigEndian.PutUint16(portLen, uint16(len(portBytes)))
-
-			addrBytes := []byte(addrKey)
-			addrLen := make([]byte, 2)
-			binary.BigEndian.PutUint16(addrLen, uint16(len(addrBytes)))
-
-			if _, err := stream.Write(header); err != nil {
-				stream.Close()
-				packetPool.Put(buffer)
-				continue
-			}
-			if _, err := stream.Write(portLen); err != nil {
-				stream.Close()
-				packetPool.Put(buffer)
-				continue
-			}
-			if _, err := stream.Write(portBytes); err != nil {
-				stream.Close()
-				packetPool.Put(buffer)
-				continue
-			}
-			if _, err := stream.Write(addrLen); err != nil {
-				stream.Close()
-				packetPool.Put(buffer)
-				continue
-			}
-			if _, err := stream.Write(addrBytes); err != nil {
-				stream.Close()
-				packetPool.Put(buffer)
-				continue
-			}
+			// Send forward header
+			header := []byte{UDP_FORWARD}
+			portBytes := []byte(rule.targetPort)
+			header = append(header, byte(len(portBytes)))
+			header = append(header, portBytes...)
+			stream.Write(header)
 
 			sess = &UDPSession{
-				clientAddr: addr,
+				conn:       conn,
 				stream:     stream,
+				clientAddr: clientAddr,
 				lastActive: time.Now(),
-				writeChan:  make(chan []byte, 256),
 			}
-			sessions.Store(addrKey, sess)
 
-			go func(s *UDPSession, key string) {
-				defer func() {
-					s.stream.Close()
-					sessions.Delete(key)
-				}()
+			sessionsMu.Lock()
+			sessions[sessionKey] = sess
+			sessionsMu.Unlock()
 
-				readBuffer := make([]byte, 65535)
+			// Handle responses
+			go func(s *smux.Stream, session *UDPSession) {
+				defer s.Close()
+				respBuf := make([]byte, 16384) // Reduced for lower latency
 				for {
-					lenBuf := make([]byte, 4)
-					if _, err := io.ReadFull(s.stream, lenBuf); err != nil {
+					// Read length prefix
+					lenBuf := make([]byte, 2)
+					if _, err := io.ReadFull(s, lenBuf); err != nil {
+						sessionsMu.Lock()
+						delete(sessions, sessionKey)
+						sessionsMu.Unlock()
+						return
+					}
+					length := binary.BigEndian.Uint16(lenBuf)
+
+					// Read data
+					if _, err := io.ReadFull(s, respBuf[:length]); err != nil {
+						sessionsMu.Lock()
+						delete(sessions, sessionKey)
+						sessionsMu.Unlock()
 						return
 					}
 
-					dataLen := binary.BigEndian.Uint32(lenBuf)
-					if dataLen == 0 || dataLen > 65535 {
-						return
-					}
-
-					if _, err := io.ReadFull(s.stream, readBuffer[:dataLen]); err != nil {
-						return
-					}
-
-					s.mu.Lock()
-					s.lastActive = time.Now()
-					s.mu.Unlock()
-
-					udpConn.WriteToUDP(readBuffer[:dataLen], s.clientAddr)
+					session.mu.Lock()
+					session.conn.WriteToUDP(respBuf[:length], session.clientAddr)
+					session.lastActive = time.Now()
+					session.mu.Unlock()
 				}
-			}(sess, addrKey)
-
-			go func(s *UDPSession) {
-				batch := make([]byte, 0, bufferSize)
-				lenBuf := make([]byte, 4)
-
-				timer := time.NewTimer(time.Millisecond)
-				timer.Stop()
-				packets := 0
-
-				flush := func() {
-					if len(batch) > 0 {
-						s.stream.Write(batch)
-						batch = batch[:0]
-						packets = 0
-					}
-				}
-
-				for {
-					select {
-					case data, ok := <-s.writeChan:
-						if !ok {
-							flush()
-							return
-						}
-
-						binary.BigEndian.PutUint32(lenBuf, uint32(len(data)))
-
-						if len(batch)+4+len(data) > cap(batch) {
-							flush()
-						}
-
-						batch = append(batch, lenBuf...)
-						batch = append(batch, data...)
-						packets++
-
-						if packets >= udpBatchSize {
-							flush()
-							timer.Stop()
-						} else if packets == 1 {
-							timer.Reset(time.Millisecond)
-						}
-
-					case <-timer.C:
-						flush()
-					}
-				}
-			}(sess)
+			}(stream, sess)
 		}
 
-		data := make([]byte, n)
-		copy(data, buffer[:n])
-		packetPool.Put(buffer)
-
-		select {
-		case sess.writeChan <- data:
-		default:
-		}
+		sess.mu.Lock()
+		sess.lastActive = time.Now()
+		// Send data through stream with length prefix
+		lenBuf := make([]byte, 2)
+		binary.BigEndian.PutUint16(lenBuf, uint16(n))
+		sess.stream.Write(lenBuf)
+		sess.stream.Write(buf[:n])
+		sess.mu.Unlock()
 	}
 }
 
-func runVPNMulti(hosts, port, token string, mappings []ForwardMapping, strategy string) {
-	hostList := strings.Split(hosts, ",")
-	if len(hostList) == 0 {
-		log.Fatal("No relay hosts provided")
+func runVPN() {
+	// Validate strategy
+	if *strategy != "multi" && *strategy != "failover" {
+		log.Fatalf("Invalid strategy '%s'. Use 'multi' or 'failover'", *strategy)
 	}
 
-	for i := range hostList {
-		hostList[i] = strings.TrimSpace(hostList[i])
+	// Parse multiple hosts
+	hosts := strings.Split(*host, ",")
+	for i := range hosts {
+		hosts[i] = strings.TrimSpace(hosts[i])
 	}
 
-	log.Printf("VPN: Multi-relay mode with %d relays, strategy: %s", len(hostList), strategy)
+	log.Printf("Configuring VPN with %d relay servers: %v", len(hosts), hosts)
+	log.Printf("Strategy: %s", *strategy)
 
-	pool := &RelayPool{
-		relays:   make([]*RelayConnection, len(hostList)),
-		token:    token,
-		mappings: mappings,
+	forwardRules := *forward + "|" + *forwardudp
+
+	manager := &RelayManager{
+		relays:        make([]*RelayConnection, len(hosts)),
+		token:         *token,
+		forwardRules:  forwardRules,
+		strategy:      *strategy,
+		reconnectChan: make(chan string, len(hosts)),
 	}
 
-	for i, host := range hostList {
-		pool.relays[i] = &RelayConnection{
-			host: host,
-			port: port,
+	// Initialize relay connections
+	for i, h := range hosts {
+		manager.relays[i] = &RelayConnection{
+			host: h,
 		}
-		pool.relays[i].healthy.Store(false)
 	}
 
-	for i, relay := range pool.relays {
-		go pool.maintainConnection(i, relay)
+	// Start connection manager
+	var wg sync.WaitGroup
+	for _, relay := range manager.relays {
+		wg.Add(1)
+		go func(r *RelayConnection) {
+			defer wg.Done()
+			manager.maintainConnection(r)
+		}(relay)
 	}
 
-	go pool.healthMonitor()
+	// Monitor and manage active relay
+	go manager.monitorRelays()
 
-	if strategy == "loadbalance" {
-		pool.runLoadBalanced()
-	} else {
-		pool.runFailover()
-	}
+	// Wait for all connection goroutines
+	wg.Wait()
 }
 
-func (p *RelayPool) maintainConnection(index int, relay *RelayConnection) {
+func (rm *RelayManager) maintainConnection(relay *RelayConnection) {
 	for {
-		log.Printf("VPN: [Relay %d] Connecting to %s:%s", index, relay.host, relay.port)
+		log.Printf("[%s] Connecting to relay server...", relay.host)
 
-		conn, err := net.DialTimeout("tcp", net.JoinHostPort(relay.host, relay.port), 10*time.Second)
+		conn, err := net.Dial("tcp", relay.host)
 		if err != nil {
-			log.Printf("VPN: [Relay %d] Failed to connect: %v", index, err)
-			relay.healthy.Store(false)
-			relay.failures.Add(1)
-			time.Sleep(reconnectDelay)
+			log.Printf("[%s] Failed to connect: %v. Retrying in 2s...", relay.host, err)
+			relay.connected.Store(false)
+			time.Sleep(2 * time.Second)
 			continue
 		}
 
-		if !authenticate(conn, p.token, true) {
-			log.Printf("VPN: [Relay %d] Authentication failed", index)
+		// Disable Nagle's algorithm on tunnel connection for lower latency
+		if tcpConn, ok := conn.(*net.TCPConn); ok {
+			tcpConn.SetNoDelay(true)
+		}
+
+		// Authenticate
+		conn.Write([]byte(rm.token))
+		buf := make([]byte, 2)
+		n, err := conn.Read(buf)
+		if err != nil || string(buf[:n]) != "OK" {
+			log.Printf("[%s] Authentication failed", relay.host)
 			conn.Close()
-			relay.healthy.Store(false)
-			relay.failures.Add(1)
-			time.Sleep(reconnectDelay)
+			relay.connected.Store(false)
+			time.Sleep(2 * time.Second)
 			continue
 		}
 
-		log.Printf("VPN: [Relay %d] Authenticated", index)
+		// Send forward rules
+		ruleLen := make([]byte, 2)
+		binary.BigEndian.PutUint16(ruleLen, uint16(len(rm.forwardRules)))
+		if _, err := conn.Write(ruleLen); err != nil {
+			log.Printf("[%s] Failed to send forward rules length: %v", relay.host, err)
+			conn.Close()
+			relay.connected.Store(false)
+			time.Sleep(2 * time.Second)
+			continue
+		}
+		if _, err := conn.Write([]byte(rm.forwardRules)); err != nil {
+			log.Printf("[%s] Failed to send forward rules: %v", relay.host, err)
+			conn.Close()
+			relay.connected.Store(false)
+			time.Sleep(2 * time.Second)
+			continue
+		}
 
+		log.Printf("[%s] Connected and authenticated", relay.host)
+
+		// Create smux session with optimized config
 		smuxConfig := smux.DefaultConfig()
-		smuxConfig.KeepAliveInterval = keepAliveInterval
-		smuxConfig.KeepAliveTimeout = keepAliveTimeout
-		smuxConfig.MaxFrameSize = bufferSize
-		smuxConfig.MaxReceiveBuffer = 4 * 1024 * 1024
+		smuxConfig.MaxReceiveBuffer = 4194304              // 4MB receive buffer
+		smuxConfig.MaxStreamBuffer = 1048576               // 1MB per stream (reduced to fight bufferbloat)
+		smuxConfig.KeepAliveInterval = 10 * time.Second
+		smuxConfig.KeepAliveTimeout = 30 * time.Second
 
 		session, err := smux.Client(conn, smuxConfig)
 		if err != nil {
-			log.Printf("VPN: [Relay %d] Failed to create smux session: %v", index, err)
+			log.Printf("[%s] Failed to create smux session: %v", relay.host, err)
 			conn.Close()
-			relay.healthy.Store(false)
-			relay.failures.Add(1)
-			time.Sleep(reconnectDelay)
+			relay.connected.Store(false)
+			time.Sleep(2 * time.Second)
 			continue
 		}
 
-		log.Printf("VPN: [Relay %d] Session established", index)
-
+		// Update relay state
 		relay.mu.Lock()
-		relay.session = session
 		relay.conn = conn
-		relay.lastSuccess = time.Now()
+		relay.session = session
+		relay.lastCheck = time.Now()
 		relay.mu.Unlock()
-		relay.healthy.Store(true)
-		relay.failures.Store(0)
+		relay.connected.Store(true)
 
-		for _, mapping := range p.mappings {
-			if mapping.IsUDP {
-				if err := setupUDPForward(session, mapping); err != nil {
-					log.Printf("VPN: [Relay %d] Failed to setup UDP forward %s:%s: %v", index, mapping.SrcPort, mapping.TargetPort, err)
-				} else {
-					log.Printf("VPN: [Relay %d] Setup UDP forward %s -> %s", index, mapping.SrcPort, mapping.TargetPort)
-				}
-			} else {
-				if err := setupTCPForward(session, mapping); err != nil {
-					log.Printf("VPN: [Relay %d] Failed to setup TCP forward %s:%s: %v", index, mapping.SrcPort, mapping.TargetPort, err)
-				} else {
-					log.Printf("VPN: [Relay %d] Setup TCP forward %s -> %s", index, mapping.SrcPort, mapping.TargetPort)
-				}
-			}
+		// Notify that this relay is ready
+		select {
+		case rm.reconnectChan <- relay.host:
+		default:
 		}
 
-		go handleVPNStreams(session, p.mappings)
+		// Handle VPN session
+		rm.handleVPNSession(relay, session)
 
-		for {
-			time.Sleep(keepAliveInterval)
-			if session.IsClosed() {
-				break
-			}
-		}
-
+		// Connection lost
 		relay.mu.Lock()
-		relay.session = nil
-		relay.conn = nil
+		relay.active.Store(false)
+		relay.connected.Store(false)
 		relay.mu.Unlock()
-		relay.healthy.Store(false)
 
 		session.Close()
 		conn.Close()
-
-		log.Printf("VPN: [Relay %d] Connection lost, reconnecting in %v", index, reconnectDelay)
-		time.Sleep(reconnectDelay)
+		log.Printf("[%s] Connection lost. Reconnecting in 2s...", relay.host)
+		
+		// Notify monitor that we need to switch relays
+		select {
+		case rm.reconnectChan <- relay.host:
+		default:
+		}
+		
+		time.Sleep(2 * time.Second)
 	}
 }
 
-func (p *RelayPool) healthMonitor() {
-	ticker := time.NewTicker(healthCheckPeriod)
+func (rm *RelayManager) monitorRelays() {
+	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
-	for range ticker.C {
-		healthy := 0
-		for i, relay := range p.relays {
-			if relay.healthy.Load() {
-				healthy++
-				log.Printf("VPN: [Relay %d] Status: HEALTHY", i)
+	for {
+		select {
+		case <-ticker.C:
+			rm.checkAndSwitchRelay()
+		case <-rm.reconnectChan:
+			rm.checkAndSwitchRelay()
+		}
+	}
+}
+
+func (rm *RelayManager) checkAndSwitchRelay() {
+	rm.mu.Lock()
+	defer rm.mu.Unlock()
+
+	if rm.strategy == "multi" {
+		// Multi strategy: all connected relays should be active
+		for _, relay := range rm.relays {
+			if relay.connected.Load() && !relay.session.IsClosed() {
+				if !relay.active.Load() {
+					relay.active.Store(true)
+					log.Printf("[%s] Marked as ACTIVE (multi strategy)", relay.host)
+				}
 			} else {
-				log.Printf("VPN: [Relay %d] Status: UNHEALTHY (failures: %d)", i, relay.failures.Load())
+				if relay.active.Load() {
+					relay.active.Store(false)
+					log.Printf("[%s] Marked as INACTIVE (disconnected)", relay.host)
+				}
 			}
 		}
-		log.Printf("VPN: Total healthy relays: %d/%d", healthy, len(p.relays))
+		return
 	}
-}
 
-func (p *RelayPool) getHealthyRelay() *RelayConnection {
-	for _, relay := range p.relays {
-		if relay.healthy.Load() {
-			relay.mu.RLock()
-			session := relay.session
-			relay.mu.RUnlock()
-			if session != nil && !session.IsClosed() {
-				return relay
-			}
+	// Failover strategy: only one relay should be active
+	currentActive := rm.activeRelay.Load()
+	var currentRelay *RelayConnection
+	if currentActive != nil {
+		currentRelay = currentActive.(*RelayConnection)
+	}
+
+	// Check if current active relay is still connected
+	if currentRelay != nil && currentRelay.connected.Load() && !currentRelay.session.IsClosed() {
+		// Current relay is healthy, no need to switch
+		return
+	}
+
+	// Need to find a new active relay
+	if currentRelay != nil {
+		currentRelay.active.Store(false)
+		log.Printf("[%s] Marked as inactive", currentRelay.host)
+	}
+
+	// Find first connected relay
+	for _, relay := range rm.relays {
+		if relay.connected.Load() && !relay.session.IsClosed() {
+			relay.active.Store(true)
+			rm.activeRelay.Store(relay)
+			log.Printf("[%s] Promoted to ACTIVE relay (failover strategy)", relay.host)
+			return
 		}
 	}
-	return nil
+
+	// No relay available
+	if currentRelay != nil {
+		log.Printf("WARNING: No relay servers available, waiting for reconnection...")
+	}
 }
 
-func (p *RelayPool) getNextRelay() *RelayConnection {
-	for i := 0; i < len(p.relays); i++ {
-		idx := p.current.Add(1) % uint32(len(p.relays))
-		relay := p.relays[idx]
-		if relay.healthy.Load() {
-			relay.mu.RLock()
-			session := relay.session
-			relay.mu.RUnlock()
-			if session != nil && !session.IsClosed() {
-				return relay
-			}
-		}
-	}
-	return nil
-}
-
-func (p *RelayPool) runFailover() {
-	select {}
-}
-
-func (p *RelayPool) runLoadBalanced() {
-	select {}
-}
-
-func setupTCPForward(session *smux.Session, mapping ForwardMapping) error {
-	stream, err := session.OpenStream()
-	if err != nil {
-		return err
-	}
-	defer stream.Close()
-
-	header := []byte{0x01}
-	portBytes := []byte(mapping.SrcPort)
-	portLen := make([]byte, 2)
-	binary.BigEndian.PutUint16(portLen, uint16(len(portBytes)))
-
-	if _, err := stream.Write(header); err != nil {
-		return err
-	}
-	if _, err := stream.Write(portLen); err != nil {
-		return err
-	}
-	if _, err := stream.Write(portBytes); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func setupUDPForward(session *smux.Session, mapping ForwardMapping) error {
-	stream, err := session.OpenStream()
-	if err != nil {
-		return err
-	}
-	defer stream.Close()
-
-	header := []byte{0x02}
-	portBytes := []byte(mapping.SrcPort)
-	portLen := make([]byte, 2)
-	binary.BigEndian.PutUint16(portLen, uint16(len(portBytes)))
-
-	if _, err := stream.Write(header); err != nil {
-		return err
-	}
-	if _, err := stream.Write(portLen); err != nil {
-		return err
-	}
-	if _, err := stream.Write(portBytes); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func handleVPNStreams(session *smux.Session, mappings []ForwardMapping) {
+func (rm *RelayManager) handleVPNSession(relay *RelayConnection, session *smux.Session) {
 	for {
 		stream, err := session.AcceptStream()
 		if err != nil {
 			return
 		}
 
-		go handleVPNStream(stream, mappings)
+		go func(s *smux.Stream) {
+			defer s.Close()
+
+			// Read header
+			header := make([]byte, 2)
+			if _, err := io.ReadFull(s, header); err != nil {
+				return
+			}
+
+			proto := header[0]
+			portLen := header[1]
+			portBuf := make([]byte, portLen)
+			if _, err := io.ReadFull(s, portBuf); err != nil {
+				return
+			}
+
+			targetPort := string(portBuf)
+
+			// In failover mode, only process if this relay is active
+			// In multi mode, all connected relays process traffic
+			if !relay.active.Load() {
+				return
+			}
+
+			if proto == TCP_FORWARD {
+				handleTCPStream(s, targetPort)
+			} else if proto == UDP_FORWARD {
+				handleUDPStream(s, targetPort)
+			}
+		}(stream)
 	}
 }
 
-func handleVPNStream(stream *smux.Stream, mappings []ForwardMapping) {
-	defer stream.Close()
-
-	header := make([]byte, 1)
-	if _, err := io.ReadFull(stream, header); err != nil {
-		return
-	}
-
-	msgType := header[0]
-
-	switch msgType {
-	case 0x04:
-		handleTCPConnection(stream, mappings)
-	case 0x05:
-		handleUDPConnection(stream, mappings)
-	}
-}
-
-func handleTCPConnection(stream *smux.Stream, mappings []ForwardMapping) {
-	portLen := make([]byte, 2)
-	if _, err := io.ReadFull(stream, portLen); err != nil {
-		return
-	}
-
-	portBytes := make([]byte, binary.BigEndian.Uint16(portLen))
-	if _, err := io.ReadFull(stream, portBytes); err != nil {
-		return
-	}
-	srcPort := string(portBytes)
-
-	var targetPort string
-	for _, m := range mappings {
-		if m.SrcPort == srcPort && !m.IsUDP {
-			targetPort = m.TargetPort
-			break
-		}
-	}
-
-	if targetPort == "" {
-		return
-	}
-
-	localConn, err := net.DialTimeout("tcp", "127.0.0.1:"+targetPort, 5*time.Second)
+func handleTCPStream(stream *smux.Stream, targetPort string) {
+	target, err := net.Dial("tcp", "127.0.0.1:"+targetPort)
 	if err != nil {
+		log.Printf("Failed to connect to target %s: %v", targetPort, err)
 		return
 	}
-	defer localConn.Close()
+	defer target.Close()
+
+	// Disable Nagle's algorithm for lower latency
+	if tcpConn, ok := target.(*net.TCPConn); ok {
+		tcpConn.SetNoDelay(true)
+	}
 
 	var wg sync.WaitGroup
 	wg.Add(2)
 
+	// Stream to target (from relay)
 	go func() {
 		defer wg.Done()
-		io.Copy(localConn, stream)
-		localConn.Close()
+		buf := make([]byte, 16384) // 16KB chunks
+		for {
+			n, err := stream.Read(buf)
+			if err != nil {
+				target.Close()
+				return
+			}
+			if _, err := target.Write(buf[:n]); err != nil {
+				return
+			}
+		}
 	}()
 
+	// Target to stream (to relay)
 	go func() {
 		defer wg.Done()
-		io.Copy(stream, localConn)
-		stream.Close()
+		buf := make([]byte, 16384) // 16KB chunks
+		for {
+			n, err := target.Read(buf)
+			if err != nil {
+				stream.Close()
+				return
+			}
+			if _, err := stream.Write(buf[:n]); err != nil {
+				return
+			}
+		}
 	}()
 
 	wg.Wait()
 }
 
-func handleUDPConnection(stream *smux.Stream, mappings []ForwardMapping) {
-	defer stream.Close()
-
-	portLen := make([]byte, 2)
-	if _, err := io.ReadFull(stream, portLen); err != nil {
-		return
-	}
-
-	portBytes := make([]byte, binary.BigEndian.Uint16(portLen))
-	if _, err := io.ReadFull(stream, portBytes); err != nil {
-		return
-	}
-	srcPort := string(portBytes)
-
-	addrLen := make([]byte, 2)
-	if _, err := io.ReadFull(stream, addrLen); err != nil {
-		return
-	}
-
-	addrBytes := make([]byte, binary.BigEndian.Uint16(addrLen))
-	if _, err := io.ReadFull(stream, addrBytes); err != nil {
-		return
-	}
-
-	var targetPort string
-	for _, m := range mappings {
-		if m.SrcPort == srcPort && m.IsUDP {
-			targetPort = m.TargetPort
-			break
-		}
-	}
-
-	if targetPort == "" {
-		return
-	}
-
-	udpAddr, err := net.ResolveUDPAddr("udp", "127.0.0.1:"+targetPort)
+func handleUDPStream(stream *smux.Stream, targetPort string) {
+	addr, err := net.ResolveUDPAddr("udp", "127.0.0.1:"+targetPort)
 	if err != nil {
 		return
 	}
 
-	udpConn, err := net.DialUDP("udp", nil, udpAddr)
+	conn, err := net.DialUDP("udp", nil, addr)
 	if err != nil {
 		return
 	}
-	defer udpConn.Close()
+	defer conn.Close()
 
-	if err := udpConn.SetReadBuffer(udpBufferSize); err != nil {
-		log.Printf("VPN: failed to set UDP read buffer: %v", err)
-	}
-	if err := udpConn.SetWriteBuffer(udpBufferSize); err != nil {
-		log.Printf("VPN: failed to set UDP write buffer: %v", err)
-	}
-
-	stopChan := make(chan struct{})
 	var wg sync.WaitGroup
+	wg.Add(2)
 
-	writeChan := make(chan []byte, 256)
-
-	wg.Add(1)
+	// Read from stream, write to UDP
 	go func() {
 		defer wg.Done()
-		defer close(writeChan)
-
-		buffer := make([]byte, 65535)
+		buf := make([]byte, 16384) // Reduced for lower latency
 		for {
-			lenBuf := make([]byte, 4)
+			lenBuf := make([]byte, 2)
 			if _, err := io.ReadFull(stream, lenBuf); err != nil {
-				close(stopChan)
+				return
+			}
+			length := binary.BigEndian.Uint16(lenBuf)
+
+			if _, err := io.ReadFull(stream, buf[:length]); err != nil {
 				return
 			}
 
-			dataLen := binary.BigEndian.Uint32(lenBuf)
-			if dataLen == 0 || dataLen > 65535 {
-				close(stopChan)
-				return
-			}
-
-			if _, err := io.ReadFull(stream, buffer[:dataLen]); err != nil {
-				close(stopChan)
-				return
-			}
-
-			data := make([]byte, dataLen)
-			copy(data, buffer[:dataLen])
-
-			select {
-			case writeChan <- data:
-			case <-stopChan:
-				return
-			}
+			conn.Write(buf[:length])
 		}
 	}()
 
-	wg.Add(1)
+	// Read from UDP, write to stream
 	go func() {
 		defer wg.Done()
-
+		buf := make([]byte, 16384) // Reduced for lower latency
 		for {
-			select {
-			case data, ok := <-writeChan:
-				if !ok {
-					return
-				}
-				udpConn.Write(data)
-			case <-stopChan:
+			conn.SetReadDeadline(time.Now().Add(2 * time.Minute))
+			n, err := conn.Read(buf)
+			if err != nil {
 				return
 			}
-		}
-	}()
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-
-		batch := make([]byte, 0, bufferSize)
-		lenBuf := make([]byte, 4)
-		buffer := make([]byte, 2048)
-		packets := 0
-
-		timer := time.NewTimer(time.Millisecond)
-		timer.Stop()
-
-		readChan := make(chan []byte, 256)
-
-		go func() {
-			for {
-				n, err := udpConn.Read(buffer)
-				if err != nil {
-					close(readChan)
-					return
-				}
-
-				data := make([]byte, n)
-				copy(data, buffer[:n])
-
-				select {
-				case readChan <- data:
-				case <-stopChan:
-					close(readChan)
-					return
-				}
-			}
-		}()
-
-		flush := func() {
-			if len(batch) > 0 {
-				stream.Write(batch)
-				batch = batch[:0]
-				packets = 0
-			}
-		}
-
-		for {
-			select {
-			case data, ok := <-readChan:
-				if !ok {
-					flush()
-					return
-				}
-
-				binary.BigEndian.PutUint32(lenBuf, uint32(len(data)))
-
-				if len(batch)+4+len(data) > cap(batch) {
-					flush()
-				}
-
-				batch = append(batch, lenBuf...)
-				batch = append(batch, data...)
-				packets++
-
-				if packets >= udpBatchSize {
-					flush()
-					timer.Stop()
-				} else if packets == 1 {
-					timer.Reset(time.Millisecond)
-				}
-
-			case <-timer.C:
-				flush()
-
-			case <-stopChan:
-				flush()
-				return
-			}
+			lenBuf := make([]byte, 2)
+			binary.BigEndian.PutUint16(lenBuf, uint16(n))
+			stream.Write(lenBuf)
+			stream.Write(buf[:n])
 		}
 	}()
 
 	wg.Wait()
 }
 
-func authenticate(conn net.Conn, token string, isClient bool) bool {
-	challenge := make([]byte, 32)
-	if isClient {
-		if _, err := io.ReadFull(rand.Reader, challenge); err != nil {
-			return false
-		}
-		if _, err := conn.Write(challenge); err != nil {
-			return false
-		}
-
-		expectedResponse := computeResponse(challenge, token)
-		response := make([]byte, len(expectedResponse))
-		if _, err := io.ReadFull(conn, response); err != nil {
-			return false
-		}
-
-		if string(response) != expectedResponse {
-			return false
-		}
-
-		ack := []byte{0x01}
-		if _, err := conn.Write(ack); err != nil {
-			return false
-		}
-	} else {
-		if _, err := io.ReadFull(conn, challenge); err != nil {
-			return false
-		}
-
-		response := computeResponse(challenge, token)
-		if _, err := conn.Write([]byte(response)); err != nil {
-			return false
-		}
-
-		ack := make([]byte, 1)
-		if _, err := io.ReadFull(conn, ack); err != nil {
-			return false
-		}
-
-		if ack[0] != 0x01 {
-			return false
-		}
+func parseForwardRules(rules string, proto int) []ForwardRule {
+	if rules == "" {
+		return nil
 	}
 
-	return true
+	var result []ForwardRule
+	pairs := strings.Split(rules, ";")
+	for _, pair := range pairs {
+		parts := strings.Split(pair, ",")
+		if len(parts) == 2 {
+			result = append(result, ForwardRule{
+				srcPort:    strings.TrimSpace(parts[0]),
+				targetPort: strings.TrimSpace(parts[1]),
+				proto:      proto,
+			})
+		}
+	}
+	return result
 }
 
-func computeResponse(challenge []byte, token string) string {
-	combined := append(challenge, []byte(token)...)
-	hash := uint64(0)
-	for _, b := range combined {
-		hash = hash*31 + uint64(b)
+func createReusableListener(network, address string) (net.Listener, error) {
+	lc := net.ListenConfig{
+		Control: func(network, address string, c syscall.RawConn) error {
+			var err error
+			c.Control(func(fd uintptr) {
+				err = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1)
+				if err != nil {
+					return
+				}
+				err = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, SO_REUSEPORT, 1)
+			})
+			return err
+		},
 	}
-	return fmt.Sprintf("%016x", hash)
+	return lc.Listen(nil, network, address)
+}
+
+func createReusableUDPListener(addr *net.UDPAddr) (*net.UDPConn, error) {
+	lc := net.ListenConfig{
+		Control: func(network, address string, c syscall.RawConn) error {
+			var err error
+			c.Control(func(fd uintptr) {
+				err = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1)
+				if err != nil {
+					return
+				}
+				err = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, SO_REUSEPORT, 1)
+			})
+			return err
+		},
+	}
+	conn, err := lc.ListenPacket(nil, "udp", addr.String())
+	if err != nil {
+		return nil, err
+	}
+	return conn.(*net.UDPConn), nil
 }
