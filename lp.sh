@@ -5,7 +5,7 @@ SERVICE_NAME="edtunnel"
 SERVICE_PATH="/usr/bin/edtunnel"
 WORK_DIR="/root/edtunnel"
 GO_FILE="$WORK_DIR/main.go"
-REPO_URL="https://raw.githubusercontent.com/edthepurple/EdTunnel/refs/heads/main/simple.go"
+REPO_URL="https://raw.githubusercontent.com/edthepurple/EdTunnel/refs/heads/main/main.go"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 
 # Step 1: Remove existing service and binary
