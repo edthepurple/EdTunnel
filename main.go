@@ -55,6 +55,14 @@ type RelayManager struct {
 	mu            sync.RWMutex
 }
 
+// ActiveRelaySession tracks the current active session on the relay server
+// to allow immediate cleanup when a VPN client reconnects
+type ActiveRelaySession struct {
+	session   *smux.Session
+	listeners []io.Closer
+	mu        sync.Mutex
+}
+
 var (
 	mode       = flag.String("mode", "", "Mode: relay or vpn")
 	port       = flag.String("port", "", "Relay server port")
@@ -63,6 +71,10 @@ var (
 	forward    = flag.String("forward", "", "TCP port forwarding (src,target;src,target)")
 	forwardudp = flag.String("forwardudp", "", "UDP port forwarding (src,target;src,target)")
 	strategy   = flag.String("strategy", "multi", "Strategy: multi (all relays active) or failover (one active at a time)")
+
+	// Track current relay session for immediate cleanup on VPN reconnection
+	currentRelaySession   *ActiveRelaySession
+	currentRelaySessionMu sync.Mutex
 )
 
 func main() {
@@ -107,6 +119,51 @@ func runRelay() {
 	}
 }
 
+// closeCurrentSession closes the current active session and all its listeners
+func closeCurrentSession() {
+	currentRelaySessionMu.Lock()
+	defer currentRelaySessionMu.Unlock()
+
+	if currentRelaySession != nil {
+		currentRelaySession.mu.Lock()
+		log.Printf("Closing previous session to allow immediate reconnection...")
+
+		// Close all listeners first to free up ports
+		for _, l := range currentRelaySession.listeners {
+			l.Close()
+		}
+		currentRelaySession.listeners = nil
+
+		// Close the session
+		if currentRelaySession.session != nil && !currentRelaySession.session.IsClosed() {
+			currentRelaySession.session.Close()
+		}
+		currentRelaySession.mu.Unlock()
+
+		currentRelaySession = nil
+		log.Printf("Previous session closed, ports freed")
+	}
+}
+
+// setCurrentSession sets the current active session
+func setCurrentSession(session *smux.Session) *ActiveRelaySession {
+	currentRelaySessionMu.Lock()
+	defer currentRelaySessionMu.Unlock()
+
+	currentRelaySession = &ActiveRelaySession{
+		session:   session,
+		listeners: make([]io.Closer, 0),
+	}
+	return currentRelaySession
+}
+
+// addListener adds a listener to the current session for cleanup tracking
+func (ars *ActiveRelaySession) addListener(l io.Closer) {
+	ars.mu.Lock()
+	defer ars.mu.Unlock()
+	ars.listeners = append(ars.listeners, l)
+}
+
 func handleRelayConnection(conn net.Conn) {
 	defer conn.Close()
 
@@ -126,6 +183,10 @@ func handleRelayConnection(conn net.Conn) {
 		log.Printf("Authentication failed from %s", conn.RemoteAddr())
 		return
 	}
+
+	// Close any existing session BEFORE sending OK
+	// This ensures ports are freed immediately for the new connection
+	closeCurrentSession()
 
 	// Send OK (2 bytes)
 	if _, err := conn.Write([]byte("OK")); err != nil {
@@ -175,13 +236,12 @@ func handleRelayConnection(conn net.Conn) {
 		}
 		defer session.Close()
 
+		// Register this session as the current active session
+		activeSession := setCurrentSession(session)
+
 		// Parse forward rules
 		tcpRules := parseForwardRules(forwardRules, TCP_FORWARD)
 		udpRules := parseForwardRules(forwardudpRules, UDP_FORWARD)
-
-		// Track listeners for cleanup
-		var listeners []io.Closer
-		var listenersMu sync.Mutex
 
 		// Start TCP forwarders
 		for _, rule := range tcpRules {
@@ -190,9 +250,7 @@ func handleRelayConnection(conn net.Conn) {
 				log.Printf("Failed to listen on TCP port %s: %v", rule.srcPort, err)
 				continue
 			}
-			listenersMu.Lock()
-			listeners = append(listeners, listener)
-			listenersMu.Unlock()
+			activeSession.addListener(listener)
 
 			go startTCPForwarderWithListener(session, rule, listener)
 		}
@@ -209,9 +267,7 @@ func handleRelayConnection(conn net.Conn) {
 				log.Printf("Failed to listen on UDP port %s: %v", rule.srcPort, err)
 				continue
 			}
-			listenersMu.Lock()
-			listeners = append(listeners, udpConn)
-			listenersMu.Unlock()
+			activeSession.addListener(udpConn)
 
 			go startUDPForwarderWithConn(session, rule, udpConn)
 		}
@@ -221,15 +277,9 @@ func handleRelayConnection(conn net.Conn) {
 			time.Sleep(1 * time.Second)
 		}
 
-		// Cleanup all listeners
-		log.Printf("Session closed, cleaning up listeners...")
-		time.Sleep(100 * time.Millisecond) // Grace period for in-flight operations
-		listenersMu.Lock()
-		for _, l := range listeners {
-			l.Close()
-		}
-		listenersMu.Unlock()
-		log.Printf("Cleanup complete, ready for reconnection")
+		// Cleanup is handled by closeCurrentSession on next connection
+		// or we can clean up here if session closed naturally
+		log.Printf("Session closed")
 	}
 }
 
