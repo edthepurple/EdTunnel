@@ -91,8 +91,18 @@ EOF
             break
             ;;
         KHAREJ)
-            read -p "Enter the IP address of the Iran server: " IRAN_IP
-            echo "[*] Configuring as KHAREJ (VPN mode, connecting to $IRAN_IP)..."
+            read -p "Enter the IP address(es) of the Iran server (e.g., ip1:8080 or ip1:8080,ip2:8080): " IRAN_INPUT
+            
+            # Check if ports are already included
+            if [[ $IRAN_INPUT == *":"* ]]; then
+                # User provided port(s), use as-is
+                IRAN_HOST="$IRAN_INPUT"
+            else
+                # No port provided, append default port
+                IRAN_HOST="${IRAN_INPUT}:8080"
+            fi
+            
+            echo "[*] Configuring as KHAREJ (VPN mode, connecting to $IRAN_HOST)..."
             cat > "$SERVICE_FILE" <<EOF
 [Unit]
 Description=EDTunnel Relay Service
@@ -101,7 +111,7 @@ Wants=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/edtunnel -mode vpn -host ${IRAN_IP}:8080 -token lp -forward 42500,42200 -forwardudp 42300,42100
+ExecStart=/usr/bin/edtunnel -mode vpn -host ${IRAN_HOST} -token lp -forward 42500,42200 -forwardudp 42300,42100
 Restart=always
 RestartSec=5
 
