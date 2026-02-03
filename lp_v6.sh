@@ -8,6 +8,66 @@ GO_FILE="$WORK_DIR/main.go"
 REPO_URL="https://raw.githubusercontent.com/edthepurple/EdTunnel/refs/heads/main/v6ready.go"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 
+# ---------------------------------------------------------------------------
+# format_host: takes a single host entry (with or without port) and returns
+#   a properly formatted host:port string.
+#   - IPv6 bare address          → [addr]:8080
+#   - IPv6 with port             → [addr]:port   (handles both [addr]:port and addr:port)
+#   - IPv4 bare address          → addr:8080
+#   - IPv4 with port             → addr:port
+# ---------------------------------------------------------------------------
+format_host() {
+    local entry="$1"
+
+    # Already bracketed with port: [addr]:port  — just return as-is
+    if [[ "$entry" =~ ^\[.*\]:[0-9]+$ ]]; then
+        echo "$entry"
+        return
+    fi
+
+    # Bracketed without port: [addr]  — add default port
+    if [[ "$entry" =~ ^\[.*\]$ ]]; then
+        echo "${entry}:8080"
+        return
+    fi
+
+    # Count colons to distinguish IPv6 from IPv4
+    local colon_count
+    colon_count=$(echo "$entry" | tr -cd ':' | wc -c)
+
+    if (( colon_count >= 2 )); then
+        # IPv6 bare address (no brackets, no port) — wrap and add default port
+        echo "[${entry}]:8080"
+    elif (( colon_count == 1 )); then
+        # IPv4 with port already (e.g. 1.2.3.4:8080)
+        echo "$entry"
+    else
+        # IPv4 bare address — add default port
+        echo "${entry}:8080"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# format_host_list: processes a comma-separated list through format_host
+# ---------------------------------------------------------------------------
+format_host_list() {
+    local input="$1"
+    local result=""
+    IFS=',' read -ra ENTRIES <<< "$input"
+    for entry in "${ENTRIES[@]}"; do
+        entry=$(echo "$entry" | xargs)          # trim whitespace
+        [ -z "$entry" ] && continue
+        local formatted
+        formatted=$(format_host "$entry")
+        if [ -z "$result" ]; then
+            result="$formatted"
+        else
+            result="${result},${formatted}"
+        fi
+    done
+    echo "$result"
+}
+
 # Step 1: Remove existing service and binary
 echo "[*] Checking for existing service..."
 if systemctl list-unit-files | grep -q "^${SERVICE_NAME}.service"; then
@@ -95,14 +155,9 @@ EOF
             break
             ;;
         2)
-            read -p "Enter the IP address(es) of the Iran server (e.g., ip1:8080 or ip1:8080,ip2:8080): " IRAN_INPUT < /dev/tty
+            read -p "Enter the IP address(es) of the Iran server (e.g., 1.2.3.4:8080 or 2001:db8::1, comma-separated): " IRAN_INPUT < /dev/tty
 
-            # Check if ports are already included
-            if [[ $IRAN_INPUT == *":"* ]]; then
-                IRAN_HOST="$IRAN_INPUT"
-            else
-                IRAN_HOST="${IRAN_INPUT}:8080"
-            fi
+            IRAN_HOST=$(format_host_list "$IRAN_INPUT")
 
             echo "[*] Configuring as KHAREJ (VPN mode, connecting to $IRAN_HOST)..."
             cat > "$SERVICE_FILE" <<EOF
