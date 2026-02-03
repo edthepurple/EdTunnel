@@ -62,12 +62,16 @@ mv -f edtunnel "$SERVICE_PATH"
 echo "[*] Cleaning up..."
 rm -rf "$WORK_DIR"
 
-# Step 6: Ask server type
+# Step 6: Ask server type (read from /dev/tty so it works under curl | bash)
 echo ""
 echo "server irane ya kharej?"
-select LOCATION in "IRAN" "KHAREJ"; do
-    case $LOCATION in
-        IRAN)
+echo "  1) IRAN"
+echo "  2) KHAREJ"
+
+while true; do
+    read -p "#? " CHOICE < /dev/tty
+    case $CHOICE in
+        1)
             echo "[*] Configuring as IRAN (relay mode)..."
             cat > "$SERVICE_FILE" <<EOF
 [Unit]
@@ -90,18 +94,16 @@ WantedBy=multi-user.target
 EOF
             break
             ;;
-        KHAREJ)
-            read -p "Enter the IP address(es) of the Iran server (e.g., ip1:8080 or ip1:8080,ip2:8080): " IRAN_INPUT
-            
+        2)
+            read -p "Enter the IP address(es) of the Iran server (e.g., ip1:8080 or ip1:8080,ip2:8080): " IRAN_INPUT < /dev/tty
+
             # Check if ports are already included
             if [[ $IRAN_INPUT == *":"* ]]; then
-                # User provided port(s), use as-is
                 IRAN_HOST="$IRAN_INPUT"
             else
-                # No port provided, append default port
                 IRAN_HOST="${IRAN_INPUT}:8080"
             fi
-            
+
             echo "[*] Configuring as KHAREJ (VPN mode, connecting to $IRAN_HOST)..."
             cat > "$SERVICE_FILE" <<EOF
 [Unit]
