@@ -3,6 +3,9 @@
 # Exit on any error
 set -e
 
+# Remove edtunnel directory if it exists
+rm -rf edtunnel
+
 # Create temporary directory
 mkdir -p edtunnel
 cd edtunnel
