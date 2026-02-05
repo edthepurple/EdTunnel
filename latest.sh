@@ -13,6 +13,9 @@ go mod init edtunnel
 # Download the main.go file
 curl -sSL https://raw.githubusercontent.com/edthepurple/EdTunnel/refs/heads/main/final.go -o main.go
 
+# Tidy up dependencies
+go mod tidy
+
 # Build the application
 go build
 
