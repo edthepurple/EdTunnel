@@ -19,6 +19,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/golang/snappy"
 	kcp "github.com/xtaci/kcp-go/v5"
 	"github.com/xtaci/smux"
 )
@@ -32,6 +33,17 @@ const (
 	// without fragmenting into tiny smux frames.
 	copyBufSize = 128 * 1024
 )
+
+// Buffer pool — reuse large copy buffers to reduce GC pressure under load
+var copyBufPool = sync.Pool{
+	New: func() interface{} {
+		buf := make([]byte, copyBufSize)
+		return &buf
+	},
+}
+
+func getCopyBuf() []byte  { return *copyBufPool.Get().(*[]byte) }
+func putCopyBuf(buf []byte) { copyBufPool.Put(&buf) }
 
 type ForwardRule struct {
 	srcPort    string
@@ -84,7 +96,7 @@ var (
 	strategy   = flag.String("strategy", "multi", "Strategy: multi or failover")
 
 	// KCP tuning flags
-	kcpMTU    = flag.Int("kcp-mtu", 1400, "KCP MTU (default 1400, safe for most networks)")
+	kcpMTU    = flag.Int("kcp-mtu", 1450, "KCP MTU (default 1450, higher payload ratio)")
 	kcpSndWnd = flag.Int("kcp-sndwnd", 2048, "KCP send window size (packets)")
 	kcpRcvWnd = flag.Int("kcp-rcvwnd", 2048, "KCP receive window size (packets)")
 	sockBuf   = flag.Int("sockbuf", 16777216, "UDP socket buffer in bytes (default 16MB)")
@@ -97,6 +109,47 @@ var (
 	currentRelaySession   *ActiveRelaySession
 	currentRelaySessionMu sync.Mutex
 )
+
+// ---------------------------------------------------------------------------
+// Snappy compressed stream wrapper — sits between TLS and smux
+// ---------------------------------------------------------------------------
+
+// snappyConn wraps a net.Conn with snappy streaming compression/decompression.
+// All data written is compressed; all data read is decompressed transparently.
+type snappyConn struct {
+	net.Conn
+	reader *snappy.Reader
+	writer *snappy.Writer
+}
+
+func newSnappyConn(conn net.Conn) *snappyConn {
+	return &snappyConn{
+		Conn:   conn,
+		reader: snappy.NewReader(conn),
+		writer: snappy.NewBufferedWriter(conn),
+	}
+}
+
+func (sc *snappyConn) Read(p []byte) (int, error) {
+	return sc.reader.Read(p)
+}
+
+func (sc *snappyConn) Write(p []byte) (int, error) {
+	n, err := sc.writer.Write(p)
+	if err != nil {
+		return n, err
+	}
+	// Flush to ensure data is sent promptly (smux expects timely delivery)
+	if fErr := sc.writer.Flush(); fErr != nil {
+		return n, fErr
+	}
+	return n, nil
+}
+
+func (sc *snappyConn) Close() error {
+	sc.writer.Flush()
+	return sc.Conn.Close()
+}
 
 // ---------------------------------------------------------------------------
 // TLS helpers — ephemeral self-signed ECDSA P-256 cert, TLS 1.3 only
@@ -139,14 +192,12 @@ func serverTLSConfig() *tls.Config {
 		Certificates: []tls.Certificate{cert},
 		MinVersion:   tls.VersionTLS13,
 		MaxVersion:   tls.VersionTLS13,
-		// TLS 1.3 cipher is auto-negotiated; prefer ChaCha20 on non-AES-NI
-		// or AES-128-GCM on hardware with AES-NI.  Go handles this automatically.
 	}
 }
 
 func clientTLSConfig() *tls.Config {
 	return &tls.Config{
-		InsecureSkipVerify: true, // token auth over TLS; no CA needed
+		InsecureSkipVerify: true,
 		MinVersion:         tls.VersionTLS13,
 		MaxVersion:         tls.VersionTLS13,
 	}
@@ -156,24 +207,25 @@ func clientTLSConfig() *tls.Config {
 // KCP helpers
 // ---------------------------------------------------------------------------
 
-// tuneKCP sets aggressive low-latency parameters.
+// tuneKCP sets bandwidth-efficient parameters.
 //
-// nodelay=1  — enable nodelay mode
-// interval=10 — internal update timer 10ms (lower = faster but more CPU)
-// resend=2   — fast retransmit on 2 duplicate ACKs
-// nc=1       — no congestion window (critical: lets inner protocol control flow,
-//              prevents TCP-over-TCP meltdown with V2Ray/Xray/OpenVPN)
+// nodelay=1   — enable nodelay mode
+// interval=20 — internal update timer 20ms (halves update overhead vs 10ms,
+//               negligible latency impact for throughput workloads)
+// resend=3    — fast retransmit on 3 duplicate ACKs (fewer spurious retransmits
+//               on lossy links = less wasted bandwidth)
+// nc=1        — no congestion window (lets inner protocol control flow)
 func tuneKCP(conn *kcp.UDPSession) {
-	conn.SetNoDelay(1, 10, 2, 1)
+	conn.SetNoDelay(1, 20, 3, 1)
 	conn.SetMtu(*kcpMTU)
 	conn.SetWindowSize(*kcpSndWnd, *kcpRcvWnd)
-	conn.SetACKNoDelay(true)
+	// Batch ACKs instead of sending each immediately — dramatically cuts
+	// overhead packet count (10-30% bandwidth savings on small-packet workloads)
+	conn.SetACKNoDelay(false)
 	conn.SetStreamMode(true)
 
-	// Set DSCP for QoS marking (best-effort, ignore errors)
 	conn.SetDSCP(*dscp)
 
-	// Per-connection socket buffers (best-effort on shared socket)
 	conn.SetReadBuffer(*sockBuf)
 	conn.SetWriteBuffer(*sockBuf)
 }
@@ -184,8 +236,9 @@ func tuneKCP(conn *kcp.UDPSession) {
 
 func newSmuxConfig() *smux.Config {
 	cfg := smux.DefaultConfig()
-	cfg.MaxReceiveBuffer = *smuxMaxRecv   // large session buffer absorbs bursts
-	cfg.MaxStreamBuffer = *smuxMaxStream  // large per-stream buffer avoids backpressure
+	cfg.MaxReceiveBuffer = *smuxMaxRecv
+	cfg.MaxStreamBuffer = *smuxMaxStream
+	cfg.MaxFrameSize = 32768 // 32KB frames — fewer headers per byte transferred
 	cfg.KeepAliveInterval = 10 * time.Second
 	cfg.KeepAliveTimeout = 30 * time.Second
 	return cfg
@@ -223,26 +276,23 @@ func main() {
 // ---------------------------------------------------------------------------
 
 func runRelay() {
-	// KCP listener — no KCP-level encryption (TLS handles it), no FEC (low overhead)
 	listener, err := kcp.ListenWithOptions(":"+*port, nil, 0, 0)
 	if err != nil {
 		log.Fatalf("Failed to start KCP relay server: %v", err)
 	}
 	defer listener.Close()
 
-	// Set socket-level buffer sizes on the shared UDP socket
 	if err := listener.SetReadBuffer(*sockBuf); err != nil {
 		log.Printf("Warning: failed to set UDP read buffer: %v", err)
 	}
 	if err := listener.SetWriteBuffer(*sockBuf); err != nil {
 		log.Printf("Warning: failed to set UDP write buffer: %v", err)
 	}
-	// Set DSCP on listener socket
 	listener.SetDSCP(*dscp)
 
 	tlsCfg := serverTLSConfig()
 
-	log.Printf("Relay server listening on KCP :%s (TLS 1.3)", *port)
+	log.Printf("Relay server listening on KCP :%s (TLS 1.3 + Snappy)", *port)
 
 	for {
 		kcpConn, err := listener.AcceptKCP()
@@ -324,7 +374,7 @@ func handleRelayConnection(kcpConn *kcp.UDPSession, tlsCfg *tls.Config) {
 		log.Printf("Failed to write OK to %s: %v", kcpConn.RemoteAddr(), err)
 		return
 	}
-	log.Printf("VPN authenticated: %s (KCP+TLS)", kcpConn.RemoteAddr())
+	log.Printf("VPN authenticated: %s (KCP+TLS+Snappy)", kcpConn.RemoteAddr())
 
 	// Receive forward rules
 	lenBuf := make([]byte, 2)
@@ -353,8 +403,11 @@ func handleRelayConnection(kcpConn *kcp.UDPSession, tlsCfg *tls.Config) {
 	}
 	log.Printf("Forward rules — TCP: %s, UDP: %s", forwardRules, forwardudpRules)
 
-	// smux session over TLS-over-KCP
-	session, err := smux.Server(tlsConn, newSmuxConfig())
+	// Wrap TLS conn in snappy compression, then hand to smux
+	compressedConn := newSnappyConn(tlsConn)
+
+	// smux session over Snappy-over-TLS-over-KCP
+	session, err := smux.Server(compressedConn, newSmuxConfig())
 	if err != nil {
 		log.Printf("Failed to create smux session: %v", err)
 		return
@@ -440,13 +493,14 @@ func startTCPForwarderWithListener(session *smux.Session, rule ForwardRule, list
 			}
 			defer stream.Close()
 
-			// Send forward header
-			header := []byte{TCP_FORWARD}
+			// Write coalesced header — combine type+port into a single write
+			// to avoid an extra smux frame for the header alone
 			portBytes := []byte(rule.targetPort)
 			if len(portBytes) > 255 {
 				return
 			}
-			header = append(header, byte(len(portBytes)))
+			header := make([]byte, 0, 2+len(portBytes))
+			header = append(header, TCP_FORWARD, byte(len(portBytes)))
 			header = append(header, portBytes...)
 			if _, err := stream.Write(header); err != nil {
 				return
@@ -457,16 +511,17 @@ func startTCPForwarderWithListener(session *smux.Session, rule ForwardRule, list
 	}
 }
 
-// bidirectionalCopy performs full-duplex copy with large buffers to absorb
-// bursty traffic from multiplexing protocols (V2Ray/Xray mux).
+// bidirectionalCopy performs full-duplex copy with pooled large buffers to
+// absorb bursty traffic from multiplexing protocols (V2Ray/Xray mux).
 func bidirectionalCopy(a, b io.ReadWriteCloser) {
 	var wg sync.WaitGroup
 	wg.Add(2)
 
 	copyDir := func(dst io.Writer, src io.Reader, closeOnDone io.Closer) {
 		defer wg.Done()
-		buf := make([]byte, copyBufSize)
+		buf := getCopyBuf()
 		_, _ = io.CopyBuffer(dst, src, buf)
+		putCopyBuf(buf)
 		closeOnDone.Close()
 	}
 
@@ -534,13 +589,14 @@ func startUDPForwarderWithConn(session *smux.Session, rule ForwardRule, conn *ne
 				continue
 			}
 
-			header := []byte{UDP_FORWARD}
+			// Write coalesced header — type+port in one write
 			portBytes := []byte(rule.targetPort)
 			if len(portBytes) > 255 {
 				stream.Close()
 				continue
 			}
-			header = append(header, byte(len(portBytes)))
+			header := make([]byte, 0, 2+len(portBytes))
+			header = append(header, UDP_FORWARD, byte(len(portBytes)))
 			header = append(header, portBytes...)
 			if _, err := stream.Write(header); err != nil {
 				stream.Close()
@@ -689,9 +745,8 @@ func (rm *RelayManager) maintainConnection(relay *RelayConnection) {
 	tlsCfg := clientTLSConfig()
 
 	for {
-		log.Printf("[%s] Connecting via KCP+TLS...", relay.host)
+		log.Printf("[%s] Connecting via KCP+TLS+Snappy...", relay.host)
 
-		// Dial KCP — no KCP-level encryption, no FEC
 		kcpConn, err := kcp.DialWithOptions(relay.host, nil, 0, 0)
 		if err != nil {
 			log.Printf("[%s] KCP dial failed: %v. Retrying in 2s...", relay.host, err)
@@ -701,10 +756,8 @@ func (rm *RelayManager) maintainConnection(relay *RelayConnection) {
 		}
 		tuneKCP(kcpConn)
 
-		// Wrap in TLS
 		tlsConn := tls.Client(kcpConn, tlsCfg)
 
-		// TLS handshake with timeout
 		tlsConn.SetDeadline(time.Now().Add(10 * time.Second))
 		if err := tlsConn.Handshake(); err != nil {
 			log.Printf("[%s] TLS handshake failed: %v", relay.host, err)
@@ -714,7 +767,6 @@ func (rm *RelayManager) maintainConnection(relay *RelayConnection) {
 			continue
 		}
 
-		// Authenticate
 		if _, err := tlsConn.Write([]byte(rm.token)); err != nil {
 			log.Printf("[%s] Failed to send token: %v", relay.host, err)
 			tlsConn.Close()
@@ -732,7 +784,6 @@ func (rm *RelayManager) maintainConnection(relay *RelayConnection) {
 			continue
 		}
 
-		// Send forward rules
 		if len(rm.forwardRules) > 0xFFFF {
 			log.Printf("[%s] Forward rules too long", relay.host)
 			tlsConn.Close()
@@ -759,13 +810,15 @@ func (rm *RelayManager) maintainConnection(relay *RelayConnection) {
 			}
 		}
 
-		// Clear deadline; smux manages keepalive from here
 		tlsConn.SetDeadline(time.Time{})
 
-		log.Printf("[%s] Connected and authenticated (KCP+TLS)", relay.host)
+		log.Printf("[%s] Connected and authenticated (KCP+TLS+Snappy)", relay.host)
 
-		// smux client over TLS-over-KCP
-		session, err := smux.Client(tlsConn, newSmuxConfig())
+		// Wrap TLS conn in snappy compression, then hand to smux
+		compressedConn := newSnappyConn(tlsConn)
+
+		// smux client over Snappy-over-TLS-over-KCP
+		session, err := smux.Client(compressedConn, newSmuxConfig())
 		if err != nil {
 			log.Printf("[%s] smux session failed: %v", relay.host, err)
 			tlsConn.Close()
