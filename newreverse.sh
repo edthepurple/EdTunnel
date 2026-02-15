@@ -4,15 +4,28 @@ set -e
 SERVICE_NAME="edtunnel"
 SERVICE_PATH="/usr/bin/edtunnel"
 WORK_DIR="/root/edtunnel"
-
-GO_MAIN="$WORK_DIR/newreverse.go"
-GO_SOCKOPT="$WORK_DIR/sockopt_unix.go"
-
-REPO_MAIN="https://raw.githubusercontent.com/edthepurple/EdTunnel/refs/heads/main/newreverse.go"
-REPO_SOCKOPT="https://raw.githubusercontent.com/edthepurple/EdTunnel/refs/heads/main/sockopt_unix.go"
-REPO_VENDOR="https://github.com/edthepurple/EdTunnel/raw/refs/heads/main/vendor.zip"
-
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+
+AMD64_URL="https://github.com/edthepurple/EdTunnel/raw/refs/heads/main/edtunnel-linux-amd64"
+ARM64_URL="https://github.com/edthepurple/EdTunnel/raw/refs/heads/main/edtunnel-linux-arm64"
+
+echo "[*] Detecting CPU architecture..."
+ARCH=$(uname -m)
+
+case "$ARCH" in
+    x86_64)
+        DOWNLOAD_URL="$AMD64_URL"
+        echo "[*] Detected amd64 architecture."
+        ;;
+    aarch64|arm64)
+        DOWNLOAD_URL="$ARM64_URL"
+        echo "[*] Detected arm64 architecture."
+        ;;
+    *)
+        echo "[!] Unsupported architecture: $ARCH"
+        exit 1
+        ;;
+esac
 
 echo "[*] Removing old service if exists..."
 if systemctl list-unit-files | grep -q "^${SERVICE_NAME}.service"; then
@@ -26,46 +39,14 @@ if [ -f "$SERVICE_PATH" ]; then
     rm -f "$SERVICE_PATH"
 fi
 
-echo "[*] Preparing work directory..."
-rm -rf "$WORK_DIR"
+echo "[*] Downloading edtunnel binary..."
 mkdir -p "$WORK_DIR"
 cd "$WORK_DIR"
 
-echo "[*] Downloading source files..."
-curl -fsSL "$REPO_MAIN" -o "$GO_MAIN"
-curl -fsSL "$REPO_SOCKOPT" -o "$GO_SOCKOPT"
+curl -fsSL "$DOWNLOAD_URL" -o edtunnel
 
-echo "[*] Downloading vendor.zip..."
-curl -fsSL "$REPO_VENDOR" -o vendor.zip
-
-echo "[*] Installing unzip if missing..."
-if ! command -v unzip >/dev/null 2>&1; then
-    apt update -y
-    apt install -y unzip
-fi
-
-echo "[*] Extracting vendor directory..."
-unzip -q vendor.zip
-rm -f vendor.zip
-
-echo "[*] Installing Go if needed..."
-if ! command -v go >/dev/null 2>&1; then
-    if ! command -v snap >/dev/null 2>&1; then
-        apt update -y
-        apt install -y snapd
-    fi
-    snap install go --classic
-fi
-
-echo "[*] Initializing module..."
-go mod init edtunnel || true
-
-echo "[*] Building using vendored dependencies..."
-GOFLAGS="-mod=vendor" go build -o edtunnel newreverse.go sockopt_unix.go
-
+chmod +x edtunnel
 mv -f edtunnel "$SERVICE_PATH"
-chmod +x "$SERVICE_PATH"
-
 rm -rf "$WORK_DIR"
 
 echo ""
