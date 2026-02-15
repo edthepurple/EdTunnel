@@ -22,7 +22,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	utls "github.com/edthepurple/utls"
+	utls "github.com/refraction-networking/utls"
 )
 
 // ---------------------------------------------------------------------------
