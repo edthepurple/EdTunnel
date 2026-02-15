@@ -4,71 +4,76 @@ set -e
 SERVICE_NAME="edtunnel"
 SERVICE_PATH="/usr/bin/edtunnel"
 WORK_DIR="/root/edtunnel"
-GO_FILE="$WORK_DIR/newreverse.go"
-REPO_URL="https://raw.githubusercontent.com/edthepurple/EdTunnel/refs/heads/main/newreverse.go"
+
+GO_MAIN="$WORK_DIR/newreverse.go"
+GO_SOCKOPT="$WORK_DIR/sockopt_unix.go"
+
+REPO_MAIN="https://raw.githubusercontent.com/edthepurple/EdTunnel/refs/heads/main/newreverse.go"
+REPO_SOCKOPT="https://raw.githubusercontent.com/edthepurple/EdTunnel/refs/heads/main/sockopt_unix.go"
+REPO_VENDOR="https://github.com/edthepurple/EdTunnel/raw/refs/heads/main/vendor.zip"
+
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 
-# Step 1: Remove existing service and binary
-echo "[*] Checking for existing service..."
+echo "[*] Removing old service if exists..."
 if systemctl list-unit-files | grep -q "^${SERVICE_NAME}.service"; then
-    echo "[*] Found service $SERVICE_NAME, stopping and removing it..."
     systemctl stop "$SERVICE_NAME" || true
     systemctl disable "$SERVICE_NAME" || true
     rm -f "$SERVICE_FILE"
     systemctl daemon-reload
-else
-    echo "[*] No systemd service named $SERVICE_NAME found."
 fi
 
 if [ -f "$SERVICE_PATH" ]; then
-    echo "[*] Removing old binary at $SERVICE_PATH..."
     rm -f "$SERVICE_PATH"
 fi
 
-# Step 2: Setup work directory
-echo "[*] Setting up work directory..."
+echo "[*] Preparing work directory..."
 rm -rf "$WORK_DIR"
 mkdir -p "$WORK_DIR"
 cd "$WORK_DIR"
 
-# Step 3: Fetch source code (newreverse.go)
-echo "[*] Fetching source code..."
-curl -fsSL "$REPO_URL" -o "$GO_FILE"
+echo "[*] Downloading source files..."
+curl -fsSL "$REPO_MAIN" -o "$GO_MAIN"
+curl -fsSL "$REPO_SOCKOPT" -o "$GO_SOCKOPT"
 
-# Step 4: Install Go if needed
+echo "[*] Downloading vendor.zip..."
+curl -fsSL "$REPO_VENDOR" -o vendor.zip
+
+echo "[*] Installing unzip if missing..."
+if ! command -v unzip >/dev/null 2>&1; then
+    apt update -y
+    apt install -y unzip
+fi
+
+echo "[*] Extracting vendor directory..."
+unzip -q vendor.zip
+rm -f vendor.zip
+
+echo "[*] Installing Go if needed..."
 if ! command -v go >/dev/null 2>&1; then
-    echo "[*] Go not found, checking for snap..."
     if ! command -v snap >/dev/null 2>&1; then
-        echo "[*] Snap not found, installing..."
         apt update -y
         apt install -y snapd
     fi
-    echo "[*] Installing Go via snap..."
     snap install go --classic
-else
-    echo "[*] Go is already installed."
 fi
 
-# Step 5: Build Go project
-cd "$WORK_DIR"
-echo "[*] Initializing Go module..."
+echo "[*] Initializing module..."
 go mod init edtunnel || true
-echo "[*] Fetching Go dependencies..."
-go mod tidy
-echo "[*] Building binary..."
-go build -o edtunnel newreverse.go
-echo "[*] Moving binary to /usr/bin..."
+
+echo "[*] Building using vendored dependencies..."
+GOFLAGS="-mod=vendor" go build -o edtunnel newreverse.go sockopt_unix.go
+
 mv -f edtunnel "$SERVICE_PATH"
-echo "[*] Cleaning up..."
+chmod +x "$SERVICE_PATH"
+
 rm -rf "$WORK_DIR"
 
-# Step 6: Ask server type
 echo ""
 echo "server irane ya kharej?"
+
 select LOCATION in "IRAN" "KHAREJ"; do
     case $LOCATION in
         IRAN)
-            echo "[*] Configuring as IRAN (relay mode)..."
             cat > "$SERVICE_FILE" <<EOF
 [Unit]
 Description=EDTunnel Relay Service
@@ -80,7 +85,6 @@ Type=simple
 ExecStart=/usr/bin/edtunnel -mode relay -port 8080 -token edwin -tls -padding
 Restart=always
 RestartSec=5
-
 LimitNOFILE=1048576
 LimitNPROC=1048576
 
@@ -91,8 +95,6 @@ EOF
             ;;
         KHAREJ)
             read -p "Enter IRAN server IP (example: 87.248.142.12): " IRAN_HOST
-            
-            echo "[*] Configuring as KHAREJ (VPN mode)..."
             cat > "$SERVICE_FILE" <<EOF
 [Unit]
 Description=EDTunnel VPN Service
@@ -104,7 +106,6 @@ Type=simple
 ExecStart=/usr/bin/edtunnel -mode vpn -host ${IRAN_HOST} -port 8080 -forward 8443,8443 -forwardudp 8443,8443 -token edwin -tls -insecure -sni dash.cloudflare.com
 Restart=always
 RestartSec=5
-
 LimitNOFILE=1048576
 LimitNPROC=1048576
 
@@ -114,44 +115,15 @@ EOF
             break
             ;;
         *)
-            echo "Invalid selection. Choose 1 or 2."
+            echo "Invalid selection."
             ;;
     esac
 done
 
-# Step 7: Reload systemd and start service
 echo "[*] Reloading systemd..."
 systemctl daemon-reload
-echo "[*] Enabling and starting $SERVICE_NAME..."
 systemctl enable "$SERVICE_NAME"
 systemctl restart "$SERVICE_NAME"
-echo "[*] Showing service status..."
 systemctl status "$SERVICE_NAME" --no-pager
 
-# Step 8: Apply sysctl optimizations
-echo "[*] Applying optimized sysctl configuration..."
-cat > /etc/sysctl.conf <<'EOF'
-net.ipv4.ip_forward = 1
-net.ipv6.conf.all.forwarding = 1
-net.core.rmem_max = 67108864
-net.core.wmem_max = 67108864
-net.core.rmem_default = 16777216
-net.core.wmem_default = 16777216
-net.ipv4.tcp_rmem = 4096 1048576 67108864
-net.ipv4.tcp_wmem = 4096 1048576 67108864
-net.ipv4.tcp_mem = 67108864 67108864 67108864
-net.core.netdev_max_backlog = 50000
-net.core.somaxconn = 8192
-net.ipv4.tcp_window_scaling = 1
-net.ipv4.tcp_timestamps = 1
-net.ipv4.tcp_sack = 1
-net.core.netdev_budget = 600
-net.core.netdev_budget_usecs = 8000
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr
-net.ipv4.tcp_retries2 = 8
-net.ipv4.tcp_fastopen = 3
-EOF
-
-sysctl -p
-echo "[✓] sysctl configuration applied successfully."
+echo "[✓] Installation complete."
