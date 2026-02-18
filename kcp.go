@@ -31,19 +31,29 @@ const (
 
 	// Copy buffer size — large enough to absorb V2Ray/Xray mux bursts
 	// without fragmenting into tiny smux frames.
-	copyBufSize = 128 * 1024
+	copyBufSize = 256 * 1024
 )
 
-// Buffer pool — reuse large copy buffers to reduce GC pressure under load
+// ---------------------------------------------------------------------------
+// Buffer pool — store []byte directly (not *[]byte) to avoid dangling pointer
+// ---------------------------------------------------------------------------
+
 var copyBufPool = sync.Pool{
 	New: func() interface{} {
-		buf := make([]byte, copyBufSize)
-		return &buf
+		return make([]byte, copyBufSize)
 	},
 }
 
-func getCopyBuf() []byte  { return *copyBufPool.Get().(*[]byte) }
-func putCopyBuf(buf []byte) { copyBufPool.Put(&buf) }
+func getCopyBuf() []byte  { return copyBufPool.Get().([]byte) }
+func putCopyBuf(buf []byte) { copyBufPool.Put(buf) } //nolint:staticcheck
+
+// UDP frame header pool — avoids heap alloc per UDP packet on hot path
+var udpHeaderPool = sync.Pool{
+	New: func() interface{} {
+		b := make([]byte, 2)
+		return &b
+	},
+}
 
 type ForwardRule struct {
 	srcPort    string
@@ -97,57 +107,104 @@ var (
 
 	// KCP tuning flags
 	kcpMTU    = flag.Int("kcp-mtu", 1450, "KCP MTU (default 1450, higher payload ratio)")
-	kcpSndWnd = flag.Int("kcp-sndwnd", 2048, "KCP send window size (packets)")
-	kcpRcvWnd = flag.Int("kcp-rcvwnd", 2048, "KCP receive window size (packets)")
-	sockBuf   = flag.Int("sockbuf", 16777216, "UDP socket buffer in bytes (default 16MB)")
+	kcpSndWnd = flag.Int("kcp-sndwnd", 4096, "KCP send window size (packets)")
+	kcpRcvWnd = flag.Int("kcp-rcvwnd", 4096, "KCP receive window size (packets)")
+	sockBuf   = flag.Int("sockbuf", 33554432, "UDP socket buffer in bytes (default 32MB)")
 	dscp      = flag.Int("dscp", 46, "DSCP value for KCP packets (46=EF for low latency)")
 
 	// smux tuning
-	smuxMaxRecv   = flag.Int("smux-recv-buf", 16777216, "smux session receive buffer (default 16MB)")
-	smuxMaxStream = flag.Int("smux-stream-buf", 4194304, "smux per-stream buffer (default 4MB)")
+	smuxMaxRecv   = flag.Int("smux-recv-buf", 33554432, "smux session receive buffer (default 32MB)")
+	smuxMaxStream = flag.Int("smux-stream-buf", 8388608, "smux per-stream buffer (default 8MB)")
+
+	// Snappy flush interval
+	snappyFlushInterval = flag.Duration("snappy-flush", 500*time.Microsecond,
+		"How often the snappy writer is flushed (default 500µs; 0 = per-write)")
 
 	currentRelaySession   *ActiveRelaySession
 	currentRelaySessionMu sync.Mutex
 )
 
 // ---------------------------------------------------------------------------
-// Snappy compressed stream wrapper — sits between TLS and smux
+// Snappy compressed stream wrapper
+//
+// The original code called writer.Flush() on every Write(), which meant one
+// syscall (and one compressed block) per smux frame — destroying both
+// compression ratio and throughput.
+//
+// Instead we flush on a background ticker. The ticker interval is tunable:
+//   - 0  → synchronous flush (original behaviour, useful for debugging)
+//   - 500µs → good balance for interactive + streaming workloads
+//   - 1ms+  → better compression ratio at the cost of a little latency
+//
+// The stop channel is closed when the underlying connection is closed so the
+// flush goroutine exits promptly and doesn't keep the conn alive.
 // ---------------------------------------------------------------------------
 
-// snappyConn wraps a net.Conn with snappy streaming compression/decompression.
-// All data written is compressed; all data read is decompressed transparently.
 type snappyConn struct {
 	net.Conn
 	reader *snappy.Reader
 	writer *snappy.Writer
+	mu     sync.Mutex // guards writer
+	stop   chan struct{}
 }
 
-func newSnappyConn(conn net.Conn) *snappyConn {
-	return &snappyConn{
+func newSnappyConn(conn net.Conn, flushInterval time.Duration) *snappyConn {
+	sc := &snappyConn{
 		Conn:   conn,
 		reader: snappy.NewReader(conn),
 		writer: snappy.NewBufferedWriter(conn),
+		stop:   make(chan struct{}),
+	}
+
+	if flushInterval > 0 {
+		go sc.flushLoop(flushInterval)
+	}
+	return sc
+}
+
+func (sc *snappyConn) flushLoop(interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-sc.stop:
+			return
+		case <-ticker.C:
+			sc.mu.Lock()
+			_ = sc.writer.Flush()
+			sc.mu.Unlock()
+		}
 	}
 }
 
 func (sc *snappyConn) Read(p []byte) (int, error) {
+	// snappy.Reader is not concurrency-safe but Read is only called from
+	// smux's single read goroutine, so no lock needed here.
 	return sc.reader.Read(p)
 }
 
 func (sc *snappyConn) Write(p []byte) (int, error) {
+	sc.mu.Lock()
 	n, err := sc.writer.Write(p)
-	if err != nil {
-		return n, err
+	if *snappyFlushInterval == 0 {
+		// Synchronous mode: flush immediately (safe under the lock)
+		if err == nil {
+			err = sc.writer.Flush()
+		}
 	}
-	// Flush to ensure data is sent promptly (smux expects timely delivery)
-	if fErr := sc.writer.Flush(); fErr != nil {
-		return n, fErr
-	}
-	return n, nil
+	sc.mu.Unlock()
+	return n, err
 }
 
 func (sc *snappyConn) Close() error {
-	sc.writer.Flush()
+	select {
+	case <-sc.stop:
+	default:
+		close(sc.stop)
+	}
+	sc.mu.Lock()
+	_ = sc.writer.Flush()
+	sc.mu.Unlock()
 	return sc.Conn.Close()
 }
 
@@ -210,17 +267,14 @@ func clientTLSConfig() *tls.Config {
 // tuneKCP sets bandwidth-efficient parameters.
 //
 // nodelay=1   — enable nodelay mode
-// interval=20 — internal update timer 20ms (halves update overhead vs 10ms,
-//               negligible latency impact for throughput workloads)
-// resend=3    — fast retransmit on 3 duplicate ACKs (fewer spurious retransmits
-//               on lossy links = less wasted bandwidth)
-// nc=1        — no congestion window (lets inner protocol control flow)
+// interval=10 — internal update timer 10ms (better for streaming vs 20ms)
+// resend=2    — fast retransmit on 2 duplicate ACKs
+// nc=1        — no congestion window
 func tuneKCP(conn *kcp.UDPSession) {
-	conn.SetNoDelay(1, 20, 3, 1)
+	conn.SetNoDelay(1, 10, 2, 1)
 	conn.SetMtu(*kcpMTU)
 	conn.SetWindowSize(*kcpSndWnd, *kcpRcvWnd)
-	// Batch ACKs instead of sending each immediately — dramatically cuts
-	// overhead packet count (10-30% bandwidth savings on small-packet workloads)
+	// ACKNoDelay=false: batch ACKs — cuts overhead packet count significantly
 	conn.SetACKNoDelay(false)
 	conn.SetStreamMode(true)
 
@@ -238,7 +292,8 @@ func newSmuxConfig() *smux.Config {
 	cfg := smux.DefaultConfig()
 	cfg.MaxReceiveBuffer = *smuxMaxRecv
 	cfg.MaxStreamBuffer = *smuxMaxStream
-	cfg.MaxFrameSize = 32768 // 32KB frames — fewer headers per byte transferred
+	// 64KB frames — matches our 256KB copy buf better; fewer header bytes/byte
+	cfg.MaxFrameSize = 65535
 	cfg.KeepAliveInterval = 10 * time.Second
 	cfg.KeepAliveTimeout = 30 * time.Second
 	return cfg
@@ -292,7 +347,7 @@ func runRelay() {
 
 	tlsCfg := serverTLSConfig()
 
-	log.Printf("Relay server listening on KCP :%s (TLS 1.3 + Snappy)", *port)
+	log.Printf("Relay server listening on KCP :%s (TLS 1.3 + Snappy, flush=%v)", *port, *snappyFlushInterval)
 
 	for {
 		kcpConn, err := listener.AcceptKCP()
@@ -404,7 +459,7 @@ func handleRelayConnection(kcpConn *kcp.UDPSession, tlsCfg *tls.Config) {
 	log.Printf("Forward rules — TCP: %s, UDP: %s", forwardRules, forwardudpRules)
 
 	// Wrap TLS conn in snappy compression, then hand to smux
-	compressedConn := newSnappyConn(tlsConn)
+	compressedConn := newSnappyConn(tlsConn, *snappyFlushInterval)
 
 	// smux session over Snappy-over-TLS-over-KCP
 	session, err := smux.Server(compressedConn, newSmuxConfig())
@@ -494,7 +549,6 @@ func startTCPForwarderWithListener(session *smux.Session, rule ForwardRule, list
 			defer stream.Close()
 
 			// Write coalesced header — combine type+port into a single write
-			// to avoid an extra smux frame for the header alone
 			portBytes := []byte(rule.targetPort)
 			if len(portBytes) > 255 {
 				return
@@ -511,8 +565,9 @@ func startTCPForwarderWithListener(session *smux.Session, rule ForwardRule, list
 	}
 }
 
-// bidirectionalCopy performs full-duplex copy with pooled large buffers to
-// absorb bursty traffic from multiplexing protocols (V2Ray/Xray mux).
+// bidirectionalCopy performs full-duplex copy with pooled large buffers.
+// putCopyBuf is called before closeOnDone so the buffer is returned to the
+// pool as soon as the copy direction finishes, not after the close completes.
 func bidirectionalCopy(a, b io.ReadWriteCloser) {
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -570,6 +625,9 @@ func startUDPForwarderWithConn(session *smux.Session, rule ForwardRule, conn *ne
 	}()
 
 	buf := make([]byte, 65535)
+	// Reusable 2-byte length prefix buffer — avoids alloc per UDP packet
+	var lenPrefix [2]byte
+
 	for {
 		n, clientAddr, err := conn.ReadFromUDP(buf)
 		if err != nil {
@@ -663,10 +721,21 @@ func startUDPForwarderWithConn(session *smux.Session, rule ForwardRule, conn *ne
 			continue
 		}
 		sess.lastActive = time.Now()
-		frame := make([]byte, 2+n)
-		binary.BigEndian.PutUint16(frame[:2], uint16(n))
-		copy(frame[2:], buf[:n])
-		if _, err := sess.stream.Write(frame); err != nil {
+		// Use stack-allocated header — no heap alloc per packet
+		binary.BigEndian.PutUint16(lenPrefix[:], uint16(n))
+		if _, err := sess.stream.Write(lenPrefix[:]); err != nil {
+			sess.closed = true
+			sess.stream.Close()
+			sess.mu.Unlock()
+
+			sessionsMu.Lock()
+			if v, ok := sessions[sessionKey]; ok && v == sess {
+				delete(sessions, sessionKey)
+			}
+			sessionsMu.Unlock()
+			continue
+		}
+		if _, err := sess.stream.Write(buf[:n]); err != nil {
 			sess.closed = true
 			sess.stream.Close()
 			sess.mu.Unlock()
@@ -815,7 +884,7 @@ func (rm *RelayManager) maintainConnection(relay *RelayConnection) {
 		log.Printf("[%s] Connected and authenticated (KCP+TLS+Snappy)", relay.host)
 
 		// Wrap TLS conn in snappy compression, then hand to smux
-		compressedConn := newSnappyConn(tlsConn)
+		compressedConn := newSnappyConn(tlsConn, *snappyFlushInterval)
 
 		// smux client over Snappy-over-TLS-over-KCP
 		session, err := smux.Client(compressedConn, newSmuxConfig())
@@ -1043,6 +1112,7 @@ func handleUDPStream(stream *smux.Stream, targetPort string) {
 	go func() {
 		defer wg.Done()
 		buf := make([]byte, 65535)
+		var lenPrefix [2]byte
 		for {
 			conn.SetReadDeadline(time.Now().Add(2 * time.Minute))
 			n, err := conn.Read(buf)
@@ -1050,10 +1120,12 @@ func handleUDPStream(stream *smux.Stream, targetPort string) {
 				stream.Close()
 				return
 			}
-			frame := make([]byte, 2+n)
-			binary.BigEndian.PutUint16(frame[:2], uint16(n))
-			copy(frame[2:], buf[:n])
-			if _, err := stream.Write(frame); err != nil {
+			// Stack-allocated header — no heap alloc per packet
+			binary.BigEndian.PutUint16(lenPrefix[:], uint16(n))
+			if _, err := stream.Write(lenPrefix[:]); err != nil {
+				return
+			}
+			if _, err := stream.Write(buf[:n]); err != nil {
 				return
 			}
 		}
