@@ -11,7 +11,7 @@
 //   -forwardudp 51820,51820       // UDP localPort → remotePort
 //
 // The client may be started on any host; the listeners are created with
-// “0.0.0.0:port”, i.e. they accept connections from every network interface.
+// "0.0.0.0:port", i.e. they accept connections from every network interface.
 
 package main
 
@@ -27,6 +27,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 /* -------------------------------------------------------------------------
@@ -42,45 +43,108 @@ const (
 	FRAME_TCP_CLOSE     = 5
 	FRAME_UDP_DATA      = 6
 	FRAME_UDP_DATA_BACK = 7
+	FRAME_PING          = 8 // #11: keepalive
+	FRAME_PONG          = 9
 
 	PROTO_TCP = 0
 	PROTO_UDP = 1
 
 	headerSize = 12 // 1+1+2+4+4 bytes
+
+	pingInterval = 15 * time.Second // #11: heartbeat interval
+	pingTimeout  = 45 * time.Second // #11: dead connection detection
 )
 
 type Frame struct {
 	Type      uint8
-	ForwardID uint16 // 0 when the frame does not need a forward‑ID
-	StreamID  uint32 // 0 when the frame does not need a stream‑ID
-	Length    uint32 // length of Payload
-	Payload   []byte // optional
+	ForwardID uint16
+	StreamID  uint32
+	Length    uint32
+	Payload   []byte
 }
 
-// write a complete frame to w
+/* -------------------------------------------------------------------------
+#1: Buffer pools – reusable read buffers and payload slices
+---------------------------------------------------------------------- */
+
+var (
+	// Pool for 16KB read buffers (TCP relay loops)
+	buf16KPool = sync.Pool{
+		New: func() any {
+			b := make([]byte, 16*1024)
+			return &b
+		},
+	}
+
+	// Pool for 64KB read buffers (UDP)
+	buf64KPool = sync.Pool{
+		New: func() any {
+			b := make([]byte, 65535)
+			return &b
+		},
+	}
+
+	// Pool for combined write buffers (header + up to 16KB payload)
+	// Sized for the common case; larger payloads allocate fresh.
+	writeBufPool = sync.Pool{
+		New: func() any {
+			b := make([]byte, headerSize+16*1024)
+			return &b
+		},
+	}
+)
+
+func getBuf16K() *[]byte  { return buf16KPool.Get().(*[]byte) }
+func putBuf16K(b *[]byte) { buf16KPool.Put(b) }
+
+func getBuf64K() *[]byte  { return buf64KPool.Get().(*[]byte) }
+func putBuf64K(b *[]byte) { buf64KPool.Put(b) }
+
+/* -------------------------------------------------------------------------
+#2 + #4: writeFrame – stack‑allocated header, single coalesced write
+---------------------------------------------------------------------- */
+
 func writeFrame(w io.Writer, f *Frame) error {
-	hdr := make([]byte, headerSize)
+	// #2: stack‑allocated header (no heap escape for the array itself)
+	var hdr [headerSize]byte
 	hdr[0] = f.Type
 	// hdr[1] is reserved (0)
 	binary.BigEndian.PutUint16(hdr[2:4], f.ForwardID)
 	binary.BigEndian.PutUint32(hdr[4:8], f.StreamID)
 	binary.BigEndian.PutUint32(hdr[8:12], f.Length)
 
-	if _, err := w.Write(hdr); err != nil {
+	if f.Length == 0 {
+		// header-only frame – single write
+		_, err := w.Write(hdr[:])
 		return err
 	}
-	if f.Length > 0 {
-		if _, err := w.Write(f.Payload); err != nil {
-			return err
-		}
+
+	// #4: coalesced write – header + payload in one syscall
+	total := headerSize + int(f.Length)
+
+	// Try to use the pool for common sizes
+	if total <= headerSize+16*1024 {
+		bp := writeBufPool.Get().(*[]byte)
+		buf := (*bp)[:total]
+		copy(buf[:headerSize], hdr[:])
+		copy(buf[headerSize:], f.Payload)
+		_, err := w.Write(buf)
+		writeBufPool.Put(bp)
+		return err
 	}
-	return nil
+
+	// Large payload: use net.Buffers (writev scatter-gather) to avoid copying
+	bufs := net.Buffers{hdr[:], f.Payload}
+	_, err := bufs.WriteTo(w)
+	return err
 }
 
-// read a complete frame from r
+// readFrame reads a complete frame from r.
+// #1 / #3: header uses stack array; payload pooling left to the caller
+// since payloads are handed off to Write() calls and ownership transfers.
 func readFrame(r io.Reader) (*Frame, error) {
-	hdr := make([]byte, headerSize)
-	if _, err := io.ReadFull(r, hdr); err != nil {
+	var hdr [headerSize]byte // #2: stack-allocated
+	if _, err := io.ReadFull(r, hdr[:]); err != nil {
 		return nil, err
 	}
 	typ := hdr[0]
@@ -105,6 +169,16 @@ func readFrame(r io.Reader) (*Frame, error) {
 }
 
 /* -------------------------------------------------------------------------
+#5: TCP_NODELAY helper
+---------------------------------------------------------------------- */
+
+func setNoDelay(conn net.Conn) {
+	if tc, ok := conn.(*net.TCPConn); ok {
+		tc.SetNoDelay(true)
+	}
+}
+
+/* -------------------------------------------------------------------------
 Configuration handling (client side)
 ---------------------------------------------------------------------- */
 
@@ -123,7 +197,6 @@ func (p *portMappingList) String() string {
 	return strings.Join(parts, " ")
 }
 
-// flag.Value implementation – “local,remote” (repeatable)
 func (p *portMappingList) Set(value string) error {
 	parts := strings.Split(value, ",")
 	if len(parts) != 2 {
@@ -151,14 +224,16 @@ type forwardConfig struct {
 }
 
 type clientSession struct {
-	conn        net.Conn
-	token       string
-	writeCh     chan *Frame
-	forwards    map[uint16]forwardConfig               // forwardID → config
-	tcpStreams  map[uint32]net.Conn                    // streamID → remote TCP conn
-	udpSockets  map[uint16]map[uint32]*net.UDPConn      // forwardID → streamID → UDP conn
-	mu          sync.Mutex
-	wg          sync.WaitGroup
+	conn       net.Conn
+	token      string
+	writeCh    chan *Frame
+	forwards   map[uint16]forwardConfig                  // forwardID → config
+	tcpStreams sync.Map                                   // #7: lock-free lookups for TCP data path
+	udpSockets map[uint16]map[uint32]*net.UDPConn         // forwardID → streamID → UDP conn
+	mu         sync.RWMutex                               // #7: RWMutex, now only protects forwards + udpSockets
+	wg         sync.WaitGroup
+	lastPong   atomic.Int64                               // #11: unix timestamp of last pong
+	done       chan struct{}                               // signal shutdown
 }
 
 /* ---------------------------------------------------------------------
@@ -179,6 +254,7 @@ func runServer(listenPort int, token string) {
 			log.Printf("accept error: %v", err)
 			continue
 		}
+		setNoDelay(c) // #5
 		go handleClient(c, token)
 	}
 }
@@ -194,9 +270,11 @@ func handleClient(conn net.Conn, token string) {
 		token:      token,
 		writeCh:    make(chan *Frame, 1024),
 		forwards:   make(map[uint16]forwardConfig),
-		tcpStreams: make(map[uint32]net.Conn),
 		udpSockets: make(map[uint16]map[uint32]*net.UDPConn),
+		done:       make(chan struct{}),
 	}
+	sess.lastPong.Store(time.Now().Unix())
+
 	// writer goroutine (serialises all writes to the tunnel)
 	sess.wg.Add(1)
 	go func() {
@@ -209,33 +287,62 @@ func handleClient(conn net.Conn, token string) {
 		}
 	}()
 
+	// #11: heartbeat – server sends PINGs, expects PONGs
+	sess.wg.Add(1)
+	go func() {
+		defer sess.wg.Done()
+		ticker := time.NewTicker(pingInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				// Check if client is still alive
+				if time.Since(time.Unix(sess.lastPong.Load(), 0)) > pingTimeout {
+					log.Printf("client %s timed out (no pong)", sess.conn.RemoteAddr())
+					sess.conn.Close() // will break the read loop
+					return
+				}
+				select {
+				case sess.writeCh <- &Frame{Type: FRAME_PING}:
+				default:
+					// write channel full, connection probably stalled
+				}
+			case <-sess.done:
+				return
+			}
+		}
+	}()
+
 	/* ------------------ authentication ------------------ */
 	auth, err := readFrame(sess.conn)
 	if err != nil {
 		log.Printf("auth read error from %s: %v", sess.conn.RemoteAddr(), err)
+		close(sess.done)
 		close(sess.writeCh)
 		sess.wg.Wait()
 		return
 	}
 	if auth.Type != FRAME_AUTH {
 		log.Printf("expected AUTH frame, got %d", auth.Type)
+		close(sess.done)
 		close(sess.writeCh)
 		sess.wg.Wait()
 		return
 	}
 	if string(auth.Payload) != sess.token {
 		sess.writeCh <- &Frame{
-			Type:   FRAME_AUTH_RESP,
-			Length: uint32(len("FAIL")),
+			Type:    FRAME_AUTH_RESP,
+			Length:  uint32(len("FAIL")),
 			Payload: []byte("FAIL"),
 		}
+		close(sess.done)
 		close(sess.writeCh)
 		sess.wg.Wait()
 		return
 	}
 	sess.writeCh <- &Frame{
-		Type:   FRAME_AUTH_RESP,
-		Length: uint32(len("OK")),
+		Type:    FRAME_AUTH_RESP,
+		Length:  uint32(len("OK")),
 		Payload: []byte("OK"),
 	}
 
@@ -254,6 +361,7 @@ func handleClient(conn net.Conn, token string) {
 		}
 	}
 	// clean‑up
+	close(sess.done)
 	close(sess.writeCh)
 	sess.cleanup()
 	sess.wg.Wait()
@@ -265,16 +373,19 @@ Clean‑up all active streams / sockets
 --------------------------------------------------------------------- */
 
 func (s *clientSession) cleanup() {
+	// TCP streams stored in sync.Map
+	s.tcpStreams.Range(func(key, value any) bool {
+		value.(net.Conn).Close()
+		s.tcpStreams.Delete(key)
+		return true
+	})
+	// UDP sockets still under RWMutex
 	s.mu.Lock()
-	for _, c := range s.tcpStreams {
-		c.Close()
-	}
 	for _, perForward := range s.udpSockets {
 		for _, conn := range perForward {
 			conn.Close()
 		}
 	}
-	s.tcpStreams = nil
 	s.udpSockets = nil
 	s.mu.Unlock()
 }
@@ -286,7 +397,20 @@ Frame dispatcher (server side)
 func (s *clientSession) handleFrame(f *Frame) error {
 	switch f.Type {
 
-	case FRAME_CONFIG: // client tells us which remote port & protocol this forwardID uses
+	// #11: keepalive
+	case FRAME_PONG:
+		s.lastPong.Store(time.Now().Unix())
+		return nil
+
+	case FRAME_PING:
+		// Client sent us a ping (shouldn't normally happen, but be graceful)
+		select {
+		case s.writeCh <- &Frame{Type: FRAME_PONG}:
+		default:
+		}
+		return nil
+
+	case FRAME_CONFIG:
 		if len(f.Payload) != 3 {
 			return fmt.Errorf("invalid CONFIG payload length %d", len(f.Payload))
 		}
@@ -304,7 +428,6 @@ func (s *clientSession) handleFrame(f *Frame) error {
 
 		s.mu.Lock()
 		s.forwards[f.ForwardID] = cfg
-		// pre‑allocate map for UDP sockets (lazy, but harmless for TCP)
 		if cfg.proto == "udp" {
 			if _, ok := s.udpSockets[f.ForwardID]; !ok {
 				s.udpSockets[f.ForwardID] = make(map[uint32]*net.UDPConn)
@@ -314,9 +437,9 @@ func (s *clientSession) handleFrame(f *Frame) error {
 		return nil
 
 	case FRAME_TCP_CONNECT:
-		s.mu.Lock()
+		s.mu.RLock() // #7: RLock for read-only access
 		cfg, ok := s.forwards[f.ForwardID]
-		s.mu.Unlock()
+		s.mu.RUnlock()
 		if !ok {
 			return fmt.Errorf("unknown forward ID %d for TCP_CONNECT", f.ForwardID)
 		}
@@ -326,21 +449,22 @@ func (s *clientSession) handleFrame(f *Frame) error {
 		remote := fmt.Sprintf("127.0.0.1:%d", cfg.remotePort)
 		remoteConn, err := net.Dial("tcp", remote)
 		if err != nil {
-			// tell client that the connection failed
 			s.writeCh <- &Frame{Type: FRAME_TCP_CLOSE, StreamID: f.StreamID}
 			return fmt.Errorf("dial %s: %w", remote, err)
 		}
+		setNoDelay(remoteConn) // #5
 
-		s.mu.Lock()
-		s.tcpStreams[f.StreamID] = remoteConn
-		s.mu.Unlock()
+		// #7: sync.Map for tcpStreams
+		s.tcpStreams.Store(f.StreamID, remoteConn)
 
 		// pump data from remote → client
 		s.wg.Add(1)
 		go func(sid uint32, rc net.Conn) {
 			defer s.wg.Done()
 			defer rc.Close()
-			buf := make([]byte, 16*1024)
+			bp := getBuf16K() // #1: pooled buffer
+			buf := *bp
+			defer putBuf16K(bp)
 			for {
 				n, err := rc.Read(buf)
 				if n > 0 {
@@ -354,100 +478,110 @@ func (s *clientSession) handleFrame(f *Frame) error {
 					}
 				}
 				if err != nil {
-					// remote closed or error – tell client
 					s.writeCh <- &Frame{Type: FRAME_TCP_CLOSE, StreamID: sid}
 					break
 				}
 			}
-			// clean up map entry
-			s.mu.Lock()
-			delete(s.tcpStreams, sid)
-			s.mu.Unlock()
+			s.tcpStreams.Delete(sid) // #7
 		}(f.StreamID, remoteConn)
 		return nil
 
 	case FRAME_TCP_DATA:
-		s.mu.Lock()
-		rc, ok := s.tcpStreams[f.StreamID]
-		s.mu.Unlock()
+		// #7: sync.Map – lock-free lookup on hot path
+		v, ok := s.tcpStreams.Load(f.StreamID)
 		if !ok {
 			return fmt.Errorf("no TCP stream %d for data", f.StreamID)
 		}
+		rc := v.(net.Conn)
 		if len(f.Payload) > 0 {
 			if _, err := rc.Write(f.Payload); err != nil {
 				rc.Close()
-				s.mu.Lock()
-				delete(s.tcpStreams, f.StreamID)
-				s.mu.Unlock()
+				s.tcpStreams.Delete(f.StreamID)
 			}
 		}
 		return nil
 
 	case FRAME_TCP_CLOSE:
-		s.mu.Lock()
-		rc, ok := s.tcpStreams[f.StreamID]
+		// #7: sync.Map
+		v, ok := s.tcpStreams.LoadAndDelete(f.StreamID)
 		if ok {
-			rc.Close()
-			delete(s.tcpStreams, f.StreamID)
+			v.(net.Conn).Close()
 		}
-		s.mu.Unlock()
 		return nil
 
 	case FRAME_UDP_DATA:
 		forwardID := f.ForwardID
 		streamID := f.StreamID
 
-		s.mu.Lock()
+		// #8: Split locking – read lock first to check, only write-lock if we need to dial
+		s.mu.RLock()
 		cfg, ok := s.forwards[forwardID]
 		if !ok {
-			s.mu.Unlock()
+			s.mu.RUnlock()
 			return fmt.Errorf("unknown forward ID %d for UDP_DATA", forwardID)
 		}
 		if cfg.proto != "udp" {
-			s.mu.Unlock()
+			s.mu.RUnlock()
 			return fmt.Errorf("forward ID %d is not UDP", forwardID)
 		}
-		// make sure map[streamID]*net.UDPConn exists
-		if s.udpSockets[forwardID] == nil {
-			s.udpSockets[forwardID] = make(map[uint32]*net.UDPConn)
+		perFwd := s.udpSockets[forwardID]
+		var udpConn *net.UDPConn
+		if perFwd != nil {
+			udpConn = perFwd[streamID]
 		}
-		udpConn, ok := s.udpSockets[forwardID][streamID]
-		if !ok {
+		s.mu.RUnlock()
+
+		if udpConn == nil {
+			// #8: Dial outside the lock
 			remote := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: int(cfg.remotePort)}
 			var err error
 			udpConn, err = net.DialUDP("udp", nil, remote)
 			if err != nil {
-				s.mu.Unlock()
 				return fmt.Errorf("dial udp remote %s: %w", remote, err)
 			}
-			s.udpSockets[forwardID][streamID] = udpConn
 
-			// start a read loop for data coming back from the remote service
-			s.wg.Add(1)
-			go func(fid uint16, sid uint32, conn *net.UDPConn) {
-				defer s.wg.Done()
-				buf := make([]byte, 65535)
-				for {
-					n, _, err := conn.ReadFromUDP(buf)
-					if err != nil {
-						if ne, ok := err.(net.Error); ok && ne.Temporary() {
-							continue
+			// Now lock to insert
+			s.mu.Lock()
+			if s.udpSockets[forwardID] == nil {
+				s.udpSockets[forwardID] = make(map[uint32]*net.UDPConn)
+			}
+			// Double-check: another goroutine may have created it
+			if existing, ok := s.udpSockets[forwardID][streamID]; ok {
+				s.mu.Unlock()
+				udpConn.Close() // discard our duplicate
+				udpConn = existing
+			} else {
+				s.udpSockets[forwardID][streamID] = udpConn
+				s.mu.Unlock()
+
+				// start read loop for data coming back from the remote service
+				s.wg.Add(1)
+				go func(fid uint16, sid uint32, conn *net.UDPConn) {
+					defer s.wg.Done()
+					bp := getBuf64K() // #1: pooled buffer
+					buf := *bp
+					defer putBuf64K(bp)
+					for {
+						n, _, err := conn.ReadFromUDP(buf)
+						if err != nil {
+							if ne, ok := err.(net.Error); ok && ne.Temporary() {
+								continue
+							}
+							return
 						}
-						return // socket closed or fatal error
+						payload := make([]byte, n)
+						copy(payload, buf[:n])
+						s.writeCh <- &Frame{
+							Type:      FRAME_UDP_DATA_BACK,
+							ForwardID: fid,
+							StreamID:  sid,
+							Length:    uint32(n),
+							Payload:   payload,
+						}
 					}
-					payload := make([]byte, n)
-					copy(payload, buf[:n])
-					s.writeCh <- &Frame{
-						Type:      FRAME_UDP_DATA_BACK,
-						ForwardID: fid,
-						StreamID:  sid,
-						Length:    uint32(n),
-						Payload:   payload,
-					}
-				}
-			}(forwardID, streamID, udpConn)
+				}(forwardID, streamID, udpConn)
+			}
 		}
-		s.mu.Unlock()
 
 		// forward payload to remote service
 		if len(f.Payload) > 0 {
@@ -469,27 +603,26 @@ CLIENT side – state structures
 type clientState struct {
 	conn        net.Conn
 	writeCh     chan *Frame
-	forwards    map[uint16]forwardConfig          // forwardID → config (proto, remotePort)
-	tcpConns    sync.Map                          // streamID (uint32) → net.Conn (local TCP side)
-	udpForwards map[uint16]*udpForwarder          // forwardID → UDP forwarder (listener + src tracking)
+	forwards    map[uint16]forwardConfig
+	tcpConns    sync.Map                          // streamID (uint32) → net.Conn
+	udpForwards map[uint16]*udpForwarder
 	wg          sync.WaitGroup
+	lastPong    atomic.Int64                      // #11
+	done        chan struct{}
 }
 
-// udpForwarder represents a single UDP forward on the client:
-// * a UDP socket listening on all interfaces (0.0.0.0)
-// * the most‑recent source address that sent us a packet (so we can reply)
 type udpForwarder struct {
-	listener     *net.UDPConn
-	mu           sync.RWMutex // protects the maps below
-	srcToStream  map[string]uint32
-	streamToSrc  map[uint32]*net.UDPAddr
+	listener    *net.UDPConn
+	mu          sync.RWMutex
+	srcToStream map[string]uint32
+	streamToSrc map[uint32]*net.UDPAddr
 }
 
 /* -------------------------------------------------------------------------
-GLOBAL stream ID generator (used for both TCP and UDP)
+GLOBAL stream ID generator
 ---------------------------------------------------------------------- */
 
-var globalStreamID uint32 // monotonically increasing stream ID for both TCP and UDP
+var globalStreamID uint32
 
 /* -------------------------------------------------------------------------
 CLIENT entry point
@@ -501,6 +634,7 @@ func runClient(serverAddr, token string, tcpMaps, udpMaps portMappingList) {
 		log.Fatalf("cannot connect to %s: %v", serverAddr, err)
 	}
 	defer c.Close()
+	setNoDelay(c) // #5
 	log.Printf("connected to %s", serverAddr)
 
 	state := &clientState{
@@ -508,12 +642,15 @@ func runClient(serverAddr, token string, tcpMaps, udpMaps portMappingList) {
 		writeCh:     make(chan *Frame, 1024),
 		forwards:    make(map[uint16]forwardConfig),
 		udpForwards: make(map[uint16]*udpForwarder),
+		done:        make(chan struct{}),
 	}
+	state.lastPong.Store(time.Now().Unix())
 
-	// writer goroutine (single‑threaded writes to the tunnel)
-	state.wg.Add(1)
+	// #10 FIX: writer goroutine – tracked separately so we can close writeCh
+	// before wg.Wait() on the main goroutines.
+	writerDone := make(chan struct{})
 	go func() {
-		defer state.wg.Done()
+		defer close(writerDone)
 		for f := range state.writeCh {
 			if err := writeFrame(state.conn, f); err != nil {
 				log.Printf("tunnel write error: %v", err)
@@ -524,8 +661,8 @@ func runClient(serverAddr, token string, tcpMaps, udpMaps portMappingList) {
 
 	/* ------------------ authentication ------------------ */
 	state.writeCh <- &Frame{
-		Type:   FRAME_AUTH,
-		Length: uint32(len(token)),
+		Type:    FRAME_AUTH,
+		Length:  uint32(len(token)),
 		Payload: []byte(token),
 	}
 	resp, err := readFrame(state.conn)
@@ -540,7 +677,6 @@ func runClient(serverAddr, token string, tcpMaps, udpMaps portMappingList) {
 	/* ------------------ send forward configurations ------------------ */
 	var forwardID uint16 = 1
 
-	// ---- TCP forwards --------------------------------------------------
 	for _, m := range tcpMaps {
 		cfg := forwardConfig{proto: "tcp", remotePort: m.remote}
 		state.forwards[forwardID] = cfg
@@ -558,7 +694,6 @@ func runClient(serverAddr, token string, tcpMaps, udpMaps portMappingList) {
 		forwardID++
 	}
 
-	// ---- UDP forwards --------------------------------------------------
 	for _, m := range udpMaps {
 		cfg := forwardConfig{proto: "udp", remotePort: m.remote}
 		state.forwards[forwardID] = cfg
@@ -576,6 +711,26 @@ func runClient(serverAddr, token string, tcpMaps, udpMaps portMappingList) {
 		forwardID++
 	}
 
+	// #11: heartbeat – client responds to PINGs with PONGs, and monitors for timeout
+	state.wg.Add(1)
+	go func() {
+		defer state.wg.Done()
+		ticker := time.NewTicker(pingInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				if time.Since(time.Unix(state.lastPong.Load(), 0)) > pingTimeout {
+					log.Printf("server timed out (no ping received)")
+					state.conn.Close()
+					return
+				}
+			case <-state.done:
+				return
+			}
+		}
+	}()
+
 	/* ------------------ receive frames from the tunnel ------------------ */
 	state.wg.Add(1)
 	go func() {
@@ -589,6 +744,18 @@ func runClient(serverAddr, token string, tcpMaps, udpMaps portMappingList) {
 				return
 			}
 			switch f.Type {
+
+			// #11: keepalive
+			case FRAME_PING:
+				select {
+				case state.writeCh <- &Frame{Type: FRAME_PONG}:
+				default:
+				}
+				state.lastPong.Store(time.Now().Unix()) // received ping = server is alive
+
+			case FRAME_PONG:
+				state.lastPong.Store(time.Now().Unix())
+
 			case FRAME_TCP_DATA:
 				if v, ok := state.tcpConns.Load(f.StreamID); ok {
 					c := v.(net.Conn)
@@ -600,10 +767,8 @@ func runClient(serverAddr, token string, tcpMaps, udpMaps portMappingList) {
 					}
 				}
 			case FRAME_TCP_CLOSE:
-				if v, ok := state.tcpConns.Load(f.StreamID); ok {
-					c := v.(net.Conn)
-					c.Close()
-					state.tcpConns.Delete(f.StreamID)
+				if v, ok := state.tcpConns.LoadAndDelete(f.StreamID); ok {
+					v.(net.Conn).Close()
 				}
 			case FRAME_UDP_DATA_BACK:
 				if u, ok := state.udpForwards[f.ForwardID]; ok {
@@ -626,9 +791,12 @@ func runClient(serverAddr, token string, tcpMaps, udpMaps portMappingList) {
 		}
 	}()
 
-	// Wait for everything (listeners, tunnel writer/reader) to finish.
+	// #10 FIX: Wait for reader/listeners to finish, then close the write channel,
+	// then wait for the writer goroutine to drain and exit.
 	state.wg.Wait()
+	close(state.done)
 	close(state.writeCh)
+	<-writerDone
 }
 
 /* -------------------------------------------------------------------------
@@ -636,7 +804,7 @@ Helper: start a TCP listener for a forward (client side)
 ---------------------------------------------------------------------- */
 
 func startTCPListener(st *clientState, fwdID uint16, localPort, remotePort uint16) {
-	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", localPort)) // 0.0.0.0:port
+	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", localPort))
 	if err != nil {
 		log.Fatalf("cannot listen on local TCP %d: %v", localPort, err)
 	}
@@ -654,10 +822,10 @@ func startTCPListener(st *clientState, fwdID uint16, localPort, remotePort uint1
 				}
 				return
 			}
+			setNoDelay(locConn) // #5
 			sid := atomic.AddUint32(&globalStreamID, 1)
 			st.tcpConns.Store(sid, locConn)
 
-			// tell the server to open a matching connection
 			st.writeCh <- &Frame{
 				Type:      FRAME_TCP_CONNECT,
 				ForwardID: fwdID,
@@ -669,21 +837,22 @@ func startTCPListener(st *clientState, fwdID uint16, localPort, remotePort uint1
 			go func(sid uint32, lc net.Conn) {
 				defer st.wg.Done()
 				defer lc.Close()
-				buf := make([]byte, 16*1024)
+				bp := getBuf16K() // #1: pooled buffer
+				buf := *bp
+				defer putBuf16K(bp)
 				for {
 					n, err := lc.Read(buf)
 					if n > 0 {
 						data := make([]byte, n)
 						copy(data, buf[:n])
 						st.writeCh <- &Frame{
-							Type:      FRAME_TCP_DATA,
-							StreamID:  sid,
-							Length:    uint32(n),
-							Payload:   data,
+							Type:     FRAME_TCP_DATA,
+							StreamID: sid,
+							Length:   uint32(n),
+							Payload:  data,
 						}
 					}
 					if err != nil {
-						// signal close to the server
 						st.writeCh <- &Frame{
 							Type:     FRAME_TCP_CLOSE,
 							StreamID: sid,
@@ -702,7 +871,6 @@ Helper: start a UDP forward (client side) – binds to 0.0.0.0
 ---------------------------------------------------------------------- */
 
 func startUDPForward(st *clientState, fwdID uint16, localPort, remotePort uint16) {
-	// Bind the listener on all interfaces (0.0.0.0)
 	udpListener, err := net.ListenUDP("udp", &net.UDPAddr{Port: int(localPort)})
 	if err != nil {
 		log.Fatalf("cannot listen UDP %d: %v", localPort, err)
@@ -723,18 +891,18 @@ func startUDPForward(st *clientState, fwdID uint16, localPort, remotePort uint16
 	go func() {
 		defer st.wg.Done()
 		defer udpListener.Close()
-		buf := make([]byte, 65535)
+		bp := getBuf64K() // #1: pooled buffer
+		buf := *bp
+		defer putBuf64K(bp)
 		for {
 			n, src, err := udpListener.ReadFromUDP(buf)
 			if err != nil {
 				if ne, ok := err.(net.Error); ok && ne.Temporary() {
 					continue
 				}
-				// listener closed; exit goroutine
 				return
 			}
 
-			// Resolve / allocate a stream ID for this source address
 			srcKey := src.String()
 			var sid uint32
 			u.mu.RLock()
@@ -742,7 +910,6 @@ func startUDPForward(st *clientState, fwdID uint16, localPort, remotePort uint16
 			u.mu.RUnlock()
 			if !ok {
 				sid = atomic.AddUint32(&globalStreamID, 1)
-
 				u.mu.Lock()
 				u.srcToStream[srcKey] = sid
 				u.streamToSrc[sid] = src
