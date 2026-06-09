@@ -1,4 +1,3 @@
-```go
 package main
 
 import (
@@ -1021,4 +1020,3 @@ func bidirectionalCopy(a, b io.ReadWriteCloser) {
 
 	wg.Wait()
 }
-```
