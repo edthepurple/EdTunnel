@@ -276,6 +276,7 @@ func handleRelayConnection(conn net.Conn) {
         tokLen := len(*token)
         tokBuf := make([]byte, tokLen)
         if _, err := io.ReadFull(conn, tokBuf); err != nil {
+                log.Printf("Token read failed from %s: %v", conn.RemoteAddr(), err)
                 return
         }
         if string(tokBuf) != *token {
@@ -283,24 +284,26 @@ func handleRelayConnection(conn net.Conn) {
                 return
         }
 
-        closeCurrentSession()
-
         if _, err := conn.Write([]byte("OK")); err != nil {
+                log.Printf("Failed to ack auth to %s: %v", conn.RemoteAddr(), err)
                 return
         }
         log.Printf("VPN server authenticated: %s", conn.RemoteAddr())
 
         lenBuf := make([]byte, 2)
         if _, err := io.ReadFull(conn, lenBuf); err != nil {
+                log.Printf("Rule length read failed from %s: %v", conn.RemoteAddr(), err)
                 return
         }
         ruleLen := binary.BigEndian.Uint16(lenBuf)
         if ruleLen == 0 {
+                log.Printf("Empty rule set from %s, aborting handshake", conn.RemoteAddr())
                 return
         }
 
         ruleBuf := make([]byte, ruleLen)
         if _, err := io.ReadFull(conn, ruleBuf); err != nil {
+                log.Printf("Rule body read failed from %s: %v", conn.RemoteAddr(), err)
                 return
         }
 
@@ -326,6 +329,12 @@ func handleRelayConnection(conn net.Conn) {
                 return
         }
         defer session.Close()
+
+        // Only tear down the previous session once the new one is fully
+        // established. Closing it earlier (e.g. right after auth) leaves a
+        // window where a handshake failure below results in zero active
+        // TCP listeners and no smux session, with nothing logged.
+        closeCurrentSession()
 
         activeSession := setCurrentSession(session)
 
@@ -419,17 +428,20 @@ func bidirectionalCopy(a, b io.ReadWriteCloser) {
         var wg sync.WaitGroup
         wg.Add(2)
 
-        copyDir := func(dst io.Writer, src io.Reader, closeOnDone io.Closer) {
+        copyDir := func(dst io.Writer, src io.Reader, closeOnDone io.Closer, dir string) {
                 defer wg.Done()
                 bufPtr := tcpPool.Get().(*[]byte)
                 buf := *bufPtr
-                _, _ = io.CopyBuffer(dst, src, buf)
+                _, err := io.CopyBuffer(dst, src, buf)
                 tcpPool.Put(bufPtr)
+                if err != nil && err != io.EOF {
+                        log.Printf("bidirectionalCopy[%s] error: %v", dir, err)
+                }
                 closeOnDone.Close()
         }
 
-        go copyDir(b, a, b)
-        go copyDir(a, b, a)
+        go copyDir(b, a, b, "a->b")
+        go copyDir(a, b, a, "b->a")
 
         wg.Wait()
 }
