@@ -1,3 +1,4 @@
+go
 package main
 
 import (
@@ -110,7 +111,7 @@ var (
 	relayUDPSessionsMu  sync.RWMutex
 	relayUDPSessions    = make(map[string]uint32)
 	relayUDPSessionsRev = make(map[uint32]*RelayUDPSession)
-	relayNextSessionID  uint32                              = 1
+	relayNextSessionID  uint32 = 1
 )
 
 func main() {
@@ -267,7 +268,14 @@ func closeCurrentSession() {
 	}
 	currentRelaySession.mu.Unlock()
 	currentRelaySession = nil
-	log.Printf("Previous session closed, ports freed")
+
+	// FIX: Clear stale UDP sessions that hold references to the closed connections.
+	relayUDPSessionsMu.Lock()
+	relayUDPSessions = make(map[string]uint32)
+	relayUDPSessionsRev = make(map[uint32]*RelayUDPSession)
+	relayUDPSessionsMu.Unlock()
+
+	log.Printf("Previous session closed, ports and UDP states freed")
 }
 
 func setCurrentSession(session *smux.Session) *ActiveRelaySession {
