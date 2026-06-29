@@ -1,4 +1,3 @@
-go
 package main
 
 import (
@@ -159,7 +158,19 @@ func runRelay() {
 	defer relayUDPTunnelConn.Close()
 
 	log.Printf("Relay UDP tunnel listening on :%s", *port)
-	go handleRelayUDPTunnel(relayUDPTunnelConn)
+	// FIX: run handleRelayUDPTunnel in a restartable loop so that if the
+	// tunnel conn ever errors (e.g. transient OS error), the goroutine
+	// does not silently die and leave the relay deaf to VPN UDP traffic.
+	go func() {
+		for {
+			handleRelayUDPTunnel(relayUDPTunnelConn)
+			// relayUDPTunnelConn is a single long-lived socket; if
+			// ReadFromUDP returns an error other than a deliberate close
+			// we log and retry rather than exiting.
+			log.Printf("handleRelayUDPTunnel exited — restarting loop")
+			time.Sleep(100 * time.Millisecond)
+		}
+	}()
 	go cleanStaleRelaySessions()
 
 	listener, err := createReusableListener("tcp", ":"+*port)
@@ -268,14 +279,20 @@ func closeCurrentSession() {
 	}
 	currentRelaySession.mu.Unlock()
 	currentRelaySession = nil
+	log.Printf("Previous session closed, ports freed")
 
-	// FIX: Clear stale UDP sessions that hold references to the closed connections.
+	// FIX: flush stale UDP session maps so the new listener conn is used.
+	// Without this, relayUDPSessionsRev still holds entries pointing at the
+	// now-closed srcConn from the old session, causing "use of closed network
+	// connection" errors on every UDP packet until the 120-second stale
+	// eviction fires — and never firing at all if keepalives keep sessions
+	// fresh.
 	relayUDPSessionsMu.Lock()
 	relayUDPSessions = make(map[string]uint32)
 	relayUDPSessionsRev = make(map[uint32]*RelayUDPSession)
+	atomic.StoreUint32(&relayNextSessionID, 1)
 	relayUDPSessionsMu.Unlock()
-
-	log.Printf("Previous session closed, ports and UDP states freed")
+	log.Printf("UDP session maps flushed")
 }
 
 func setCurrentSession(session *smux.Session) *ActiveRelaySession {
